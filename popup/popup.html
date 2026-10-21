@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Iclaim Automation</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="mark">iC</div>
+      <div>
+        <h1>Iclaim Automation</h1>
+        <p id="status">Ready</p>
+      </div>
+    </header>
+
+    <section class="card row">
+      <div>
+        <span class="label">Automation</span>
+        <strong id="switch-label">On</strong>
+      </div>
+      <label class="switch">
+        <input id="enabled" type="checkbox" checked />
+        <span class="slider"></span>
+      </label>
+    </section>
+
+    <section class="card">
+      <label class="label" for="claim-number">Test iClaim number</label>
+      <input id="claim-number" class="field" type="text" spellcheck="false" placeholder="739956" />
+      <button id="run-claim" type="button">Search and send</button>
+    </section>
+
+    <section class="card">
+      <label class="label" for="group-name">WhatsApp group</label>
+      <input id="group-name" class="field" type="text" spellcheck="false" />
+
+      <label class="label" for="worklist-url">iClaim worklist</label>
+      <input id="worklist-url" class="field" type="text" spellcheck="false" />
+    </section>
+
+    <section class="card">
+      <span class="label">Last result</span>
+      <pre id="result">No run yet.</pre>
+    </section>
+
+    <script src="../shared.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

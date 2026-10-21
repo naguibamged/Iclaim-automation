@@ -1,0 +1,40 @@
+---
+description: Look up current WhatsApp Web UI selectors before selecting or interacting with the page
+alwaysApply: true
+---
+
+# WhatsApp Web UI
+
+WhatsApp Web changes its DOM often. Existing selectors in `content/whatsapp.js` are fallbacks, not proof they still work.
+
+When a task selects, clicks, types into, or reads WhatsApp Web (chat list, search, open chat, message bubbles, compose box, attach, document, send), search the web first for the current DOM and interaction pattern. Do this before editing selectors or click/type code.
+
+Search for the specific control, for example `WhatsApp Web send button selector 2026`, `WhatsApp Web compose box contenteditable`, or `WhatsApp Web attach document input`. Prefer recent write-ups, GitHub issues, and extension source over older blog posts.
+
+## How to pick an element
+
+Use several signals, in this order:
+
+1. `aria-label` or `title` that names the control (`Send`, `Attach`, search box)
+2. `data-testid` or `data-icon` (`wds-ic-send-filled`, `msg-container`)
+3. Role plus structure (`button`, `[role="button"]`, `[role="listitem"]`, `#main`, `#pane-side`, `footer`)
+4. Behavior hooks (`contenteditable="true"`, `input[type="file"]`)
+
+```javascript
+// ❌ BAD — one old selector, then a click
+document.querySelector('[data-testid="send"]').click();
+
+// ✅ GOOD — current lookup, then a short fallback chain
+const send =
+  document.querySelector('[data-testid="wds-ic-send-filled"]')?.closest('button, [role="button"]') ||
+  document.querySelector('button[aria-label="Send"], [role="button"][aria-label="Send"]');
+send?.click();
+```
+
+## How to interact
+
+- Click the control the user would click (`button` or `[role="button"]`), not only the inner `svg` or `span`.
+- Type into the real compose field (`footer` `contenteditable`) with input events WhatsApp listens for. Setting `textContent` alone does not send.
+- Attach files through the document `input[type="file"]` after opening Attach, not by guessing a hidden node.
+- Keep a few fallbacks. English `aria-label` text can differ by language and WhatsApp version.
+- After changing a selector, say which current source you used and which fallbacks remain.
