@@ -1,5 +1,9 @@
 importScripts("shared.js");
 
+if (chrome.storage.session.setAccessLevel) {
+  chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS" }).catch(() => {});
+}
+
 const PROCESSED_LIMIT = 200;
 
 let chain = Promise.resolve();
@@ -68,7 +72,7 @@ async function setClaimState(text, state) {
   const key = claimKey(text);
   if (!key) return;
   const claims = await getSessionClaims();
-  if (state === "failed" && claims[key] === "sent") return;
+  if (state === "failed" && (claims[key] === "sent" || claims[key] === "rejected")) return;
   claims[key] = state;
   await chrome.storage.session.set({ sessionClaims: claims });
 }
@@ -200,6 +204,24 @@ async function debuggerClick(x, y, button) {
   });
 }
 
+async function debuggerKey(key, code, keyCode, modifiers) {
+  if (!mouseDebugTarget) throw new Error("WhatsApp debugger is not attached");
+  const event = {
+    key,
+    code,
+    modifiers: modifiers || 0,
+    windowsVirtualKeyCode: keyCode,
+    nativeVirtualKeyCode: keyCode
+  };
+  await chrome.debugger.sendCommand(mouseDebugTarget, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...event });
+  await chrome.debugger.sendCommand(mouseDebugTarget, "Input.dispatchKeyEvent", { type: "keyUp", ...event });
+}
+
+async function debuggerInsertText(text) {
+  if (!mouseDebugTarget) throw new Error("WhatsApp debugger is not attached");
+  await chrome.debugger.sendCommand(mouseDebugTarget, "Input.insertText", { text });
+}
+
 function waitForDebuggerLoad(target, timeout = 20000) {
   return new Promise((resolve) => {
     const finish = () => {
@@ -311,18 +333,76 @@ async function sendToWhatsApp(tabId, message) {
   }
 }
 
-async function notifyWhatsApp(groupName, text) {
+async function isTestingMode() {
+  const session = await chrome.storage.session.get({ testingMode: false });
+  return session.testingMode === true;
+}
+
+async function testingGate() {
+  if (await isTestingMode()) return null;
+  return { ok: false, error: "Turn on testing mode first" };
+}
+
+async function failStage(message) {
+  await setLastResult(message);
+  await setStatus(message);
+  return { ok: false, error: message };
+}
+
+function formatDetectedMessages(payload) {
+  const list = Array.isArray(payload) ? payload : Array.isArray(payload?.messages) ? payload.messages : [];
+  if (!list.length) {
+    const open = payload?.chatOpen ? "Group chat is open." : "Group chat is not open.";
+    const bubbles = Number(payload?.containerCount) || 0;
+    return `No incoming messages visible.\n${open}\nMessage bubbles on screen: ${bubbles}.`;
+  }
+  const lines = [`Incoming messages: ${list.length}`];
+  for (const message of list) {
+    const text = String(message?.text || "").replace(/\s+/g, " ").trim();
+    lines.push(`- ${text} (${message?.seen ? "seen" : "new"})`);
+  }
+  return lines.join("\n");
+}
+
+function testPdfBase64() {
+  const stream = "BT /F1 18 Tf 36 80 Td (iClaim attachment test) Tj ET";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index += 1) {
+    offsets.push(body.length);
+    body += `${index + 1} 0 obj\n${objects[index]}\nendobj\n`;
+  }
+  const xrefAt = body.length;
+  let table = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index < offsets.length; index += 1) {
+    table += `${String(offsets[index]).padStart(10, "0")} 00000 n \n`;
+  }
+  body += `${table}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`;
+  return btoa(body);
+}
+
+async function notifyWhatsApp(groupName, text, quoteText) {
   const tab = await findWhatsAppTab();
-  if (!tab) return;
+  if (!tab) return false;
   await focusTab(tab);
   const response = await sendToWhatsApp(tab.id, {
     type: "SEND_TEXT",
     groupName,
-    text
+    text,
+    quoteText: quoteText || ""
   });
   if (!response?.ok) {
     console.info("Iclaim automation:", response?.error || "Could not send the WhatsApp reply");
+    return false;
   }
+  return true;
 }
 
 async function runSearch(tabId, claimNumber) {
@@ -350,6 +430,84 @@ async function runSearch(tabId, claimNumber) {
   return injected?.result || { ok: false, error: `No claim found for ${claimNumber}` };
 }
 
+async function testDetect() {
+  const blocked = await testingGate();
+  if (blocked) return blocked;
+  const settings = await getSettings();
+  await setStatus("Detecting messages");
+  const tab = await findWhatsAppTab();
+  if (!tab) return failStage("Open WhatsApp Web first");
+  const response = await sendToWhatsApp(tab.id, { type: "TEST_DETECT", groupName: settings.groupName });
+  if (!response?.ok) return failStage(response?.error || "Could not read WhatsApp messages");
+  const report = formatDetectedMessages(response);
+  const status = report.split("\n")[0] || "Detect finished";
+  await setLastResult(report);
+  await setStatus(status);
+  return { ok: true, report, status };
+}
+
+async function testReply(claimText) {
+  const blocked = await testingGate();
+  if (blocked) return blocked;
+  const settings = await getSettings();
+  await setStatus("Replying");
+  const tab = await ensureWhatsAppTab();
+  if (!tab) return failStage("Open WhatsApp Web first");
+  const response = await sendToWhatsApp(tab.id, {
+    type: "TEST_REPLY",
+    groupName: settings.groupName,
+    text: String(claimText || "").trim()
+  });
+  if (!response?.ok) return failStage(response?.error || "Could not send the reply");
+  const done = `Replied to ${response.repliedTo}`;
+  await setLastResult(done);
+  await setStatus(done);
+  return { ok: true };
+}
+
+async function testSearch(claimText) {
+  const blocked = await testingGate();
+  if (blocked) return blocked;
+  const text = String(claimText || "").trim();
+  if (!text) return failStage("Type an iClaim number");
+  const settings = await getSettings();
+  await setStatus(`Searching ${text}`);
+  const iclaimTab = await ensureIclaimTab(settings.worklistUrl);
+  const result = await runSearch(iclaimTab.id, text);
+  if (!result?.ok) return failStage(result?.error || `No claim found for ${text}`);
+  if (result.reply) {
+    await setLastResult(result.reply);
+    await setStatus(result.reply);
+    return { ok: true, report: result.reply, status: result.reply };
+  }
+  await setLastResult(result.documentUrl || `Opened claim ${text}`);
+  await setStatus("Search finished");
+  return { ok: true };
+}
+
+async function testAttach(claimText) {
+  const blocked = await testingGate();
+  if (blocked) return blocked;
+  const settings = await getSettings();
+  const caption = String(claimText || "").trim() || "test";
+  await setStatus("Sending attachment");
+  const tab = await ensureWhatsAppTab();
+  if (!tab) return failStage("Open WhatsApp Web first");
+  const filename = pdfFilename(caption);
+  const response = await sendToWhatsApp(tab.id, {
+    type: "SEND_PDF",
+    base64: testPdfBase64(),
+    filename,
+    caption,
+    groupName: settings.groupName
+  });
+  if (!response?.ok) return failStage(response?.error || "Could not send the test PDF");
+  const done = `Sent ${filename}`;
+  await setLastResult(done);
+  await setStatus(done);
+  return { ok: true };
+}
+
 async function runJob(job) {
   const settings = await getSettings();
   const groupName = job.groupName || settings.groupName;
@@ -362,6 +520,17 @@ async function runJob(job) {
     await notifyWhatsApp(groupName, error);
     await setLastResult(error);
     await setStatus(error);
+    return false;
+  }
+
+  if (result.reply) {
+    const delivered = await notifyWhatsApp(groupName, result.reply, job.text);
+    await setLastResult(result.reply);
+    await setStatus(result.reply);
+    if (result.status === "danger" && delivered) {
+      await setClaimState(job.text, "rejected");
+      return true;
+    }
     return false;
   }
 
@@ -414,7 +583,14 @@ async function drainQueue() {
     const queue = session.jobQueue || [];
     if (!queue.length) return;
 
-    const [job, ...rest] = queue;
+    let index = 0;
+    if (await isTestingMode()) {
+      index = queue.findIndex((job) => job.manual);
+      if (index < 0) return;
+    }
+
+    const job = queue[index];
+    const rest = queue.filter((_, itemIndex) => itemIndex !== index);
     await chrome.storage.session.set({ jobQueue: rest });
 
     const stored = await chrome.storage.local.get({ processedIds: [] });
@@ -439,6 +615,7 @@ async function reserveClaim(job) {
   const settings = await getSettings();
   const text = String(job.text || "").trim();
   if (!text || !job.messageId) return { ok: false };
+  if (!job.manual && (await isTestingMode())) return { ok: false };
   if (!settings.enabled && !job.manual) {
     await setStatus("Paused");
     return { ok: false };
@@ -450,6 +627,11 @@ async function reserveClaim(job) {
   const state = await claimState(text);
   if (state === "sent") {
     const reply = `Already sent ${text}`;
+    await setStatus(reply);
+    return { ok: true, duplicate: true, reply };
+  }
+  if (state === "rejected") {
+    const reply = `Already answered ${text}`;
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
@@ -467,7 +649,8 @@ async function reserveClaim(job) {
     queue.push({
       messageId: job.messageId,
       text,
-      groupName: job.groupName || settings.groupName
+      groupName: job.groupName || settings.groupName,
+      manual: job.manual === true
     });
     await chrome.storage.session.set({ jobQueue: queue });
   }
@@ -480,7 +663,14 @@ async function acceptAndRun(job) {
   if (decision.start) await drainQueue();
 }
 
+async function pauseOnLoad() {
+  const current = await chrome.storage.local.get({ jobStatus: "" });
+  if (/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) return;
+  await chrome.storage.local.set({ enabled: false, jobStatus: "Paused" });
+}
+
 async function markWatching() {
+  if (await isTestingMode()) return;
   const settings = await getSettings();
   if (!settings.enabled) {
     await setStatus("Paused");
@@ -489,22 +679,48 @@ async function markWatching() {
   const session = await chrome.storage.session.get({ jobQueue: [] });
   if ((session.jobQueue || []).length) return;
   const current = await chrome.storage.local.get({ jobStatus: "" });
-  if (/^(Searching|Saving|Sending)/.test(current.jobStatus || "")) return;
+  if (/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) return;
   await setStatus(`Watching ${settings.groupName}`);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   schedule(async () => {
     await ensureDefaults();
+    await pauseOnLoad();
     await drainQueue();
   });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  schedule(() => drainQueue());
+  schedule(async () => {
+    await pauseOnLoad();
+    await drainQueue();
+  });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (
+    message?.type === "TEST_DETECT" ||
+    message?.type === "TEST_REPLY" ||
+    message?.type === "TEST_SEARCH" ||
+    message?.type === "TEST_ATTACH"
+  ) {
+    const task = async () => {
+      try {
+        if (message.type === "TEST_DETECT") return await testDetect();
+        if (message.type === "TEST_REPLY") return await testReply(message.text);
+        if (message.type === "TEST_SEARCH") return await testSearch(message.text);
+        return await testAttach(message.text);
+      } catch (error) {
+        return failStage(error?.message || "The stage did not run");
+      }
+    };
+    schedule(task)
+      .then((result) => sendResponse(result || { ok: false, error: "The stage did not run" }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   if (message?.type === "RUN_CLAIM") {
     const text = String(message.text || "").trim();
     if (!text) {
@@ -575,6 +791,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "DEBUGGER_KEY") {
+    debuggerKey(String(message.key || ""), String(message.code || ""), Number(message.keyCode) || 0, Number(message.modifiers) || 0)
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  if (message?.type === "DEBUGGER_TEXT") {
+    debuggerInsertText(String(message.text || ""))
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   if ((message?.type === "PATCH_FILE_CLICK" || message?.type === "RESTORE_FILE_CLICK") && sender.tab?.id) {
     const patch = message.type === "PATCH_FILE_CLICK";
     chrome.scripting
@@ -607,6 +837,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   return false;
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "session" || !changes.testingMode || changes.testingMode.newValue === true) return;
+  schedule(async () => {
+    await drainQueue();
+    await markWatching();
+  });
 });
 
 schedule(() => drainQueue());

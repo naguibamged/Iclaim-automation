@@ -5,14 +5,20 @@
   const SEEN_LIMIT = 200;
   const ACK_TEXT = "getting the IClaim";
   const state = {
-    enabled: true,
+    enabled: false,
     groupName: ICLAIM_DEFAULTS.groupName,
     seenIds: new Set(),
     seeded: false,
     armed: false,
+    starting: false,
+    releaseLatest: false,
     openingForNewMessage: false,
-    ownTexts: []
+    ownTexts: [],
+    testingMode: false
   };
+
+  let sessionReady = false;
+  let pauseOnStart = true;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -57,10 +63,42 @@
 
   async function loadSettings() {
     const data = await chrome.storage.local.get(ICLAIM_DEFAULTS);
-    state.enabled = data.enabled !== false;
     state.groupName = normalizeName(data.groupName) || ICLAIM_DEFAULTS.groupName;
     const seen = await chrome.storage.local.get({ seenMessageIds: [] });
     for (const id of seen.seenMessageIds || []) state.seenIds.add(id);
+    await refreshTestingMode();
+  }
+
+  async function refreshTestingMode() {
+    try {
+      const session = await chrome.storage.session.get({ testingMode: false });
+      state.testingMode = session.testingMode === true;
+      sessionReady = true;
+    } catch (error) {
+      sessionReady = false;
+    }
+  }
+
+  async function absorbVisibleMessages() {
+    if (!chatIsOpen(state.groupName)) return;
+    const messages = chatMessages();
+    if (!messages.length && !messageAreaReady()) return;
+    const fresh = messages.filter((message) => message.id && !state.seenIds.has(message.id));
+    const newest = fresh[fresh.length - 1];
+    const absorbed = [];
+    for (const message of messages) {
+      if (newest && message.id === newest.id) continue;
+      if (message.id && !state.seenIds.has(message.id)) absorbed.push(message.id);
+      if (message.id) state.seenIds.add(message.id);
+    }
+    state.seeded = true;
+    if (!absorbed.length) return;
+    const data = await chrome.storage.local.get({ seenMessageIds: [] });
+    const ids = data.seenMessageIds || [];
+    for (const id of absorbed) {
+      if (!ids.includes(id)) ids.push(id);
+    }
+    await chrome.storage.local.set({ seenMessageIds: ids.slice(-SEEN_LIMIT) });
   }
 
   async function persistEmitted(id) {
@@ -69,6 +107,15 @@
     const ids = data.seenMessageIds || [];
     if (!ids.includes(id)) ids.push(id);
     await chrome.storage.local.set({ seenMessageIds: ids.slice(-SEEN_LIMIT) });
+  }
+
+  async function forgetSeen(id) {
+    if (!id) return;
+    state.seenIds.delete(id);
+    const data = await chrome.storage.local.get({ seenMessageIds: [] });
+    const ids = data.seenMessageIds || [];
+    const next = ids.filter((item) => item !== id);
+    if (next.length !== ids.length) await chrome.storage.local.set({ seenMessageIds: next });
   }
 
   function conversationHeader() {
@@ -360,6 +407,8 @@
   }
 
   async function emitMessage(message) {
+    if (!sessionReady) await refreshTestingMode();
+    if (state.testingMode) return;
     if (!state.enabled || !message?.id || !message.text) return;
     if (isAckText(message.text) || takeOwnText(message.text)) {
       if (!state.seenIds.has(message.id)) {
@@ -418,15 +467,24 @@
   }
 
   async function checkMessages() {
-    if (!state.armed || !state.enabled || state.openingForNewMessage) return;
-    if (!chatIsOpen(state.groupName)) return;
+    if (!state.armed || state.openingForNewMessage || state.starting) return;
+    if (!sessionReady) await refreshTestingMode();
+    if (state.testingMode || !state.enabled) return;
+    if (!chatIsOpen(state.groupName)) {
+      await openGroup(state.groupName);
+      if (!chatIsOpen(state.groupName)) return;
+    }
 
     if (!state.seeded) {
       const messages = chatMessages();
-      if (!messages.length && !messageAreaReady()) return;
+      if (!messages.length) return;
+      const last = messages[messages.length - 1];
+      if (state.releaseLatest && last) {
+        state.releaseLatest = false;
+        await forgetSeen(last.id);
+      }
       for (const message of messages.slice(0, -1)) state.seenIds.add(message.id);
       state.seeded = true;
-      const last = messages[messages.length - 1];
       if (last) await emitMessage(last);
       return;
     }
@@ -649,9 +707,12 @@
 
   function composeBox() {
     return (
-      document.querySelector('#main footer div[contenteditable="true"]') ||
-      document.querySelector('footer div[contenteditable="true"][role="textbox"]') ||
-      document.querySelector('div[contenteditable="true"][data-tab="10"]')
+      document.querySelector('#main [data-testid="conversation-compose-box-input"]') ||
+      document.querySelector('[data-testid="conversation-compose-box-input"]') ||
+      document.querySelector('div[data-lexical-editor="true"][data-tab="10"][role="textbox"]') ||
+      document.querySelector('div[contenteditable="true"][aria-placeholder="Type a message"]') ||
+      document.querySelector('#main footer div[contenteditable="true"][role="textbox"]') ||
+      document.querySelector('div[contenteditable="true"][data-tab="10"][role="textbox"]')
     );
   }
 
@@ -682,6 +743,58 @@
     return messageBody(matches[matches.length - 1] || null);
   }
 
+  function messageScroller(element) {
+    const main = document.querySelector("#main");
+    let node = element?.parentElement || null;
+    while (node && node !== document.documentElement) {
+      if (main && node !== main && !main.contains(node)) break;
+      const style = getComputedStyle(node);
+      const overflow = style.overflowY || style.overflow;
+      if (/(auto|scroll)/.test(overflow) && node.scrollHeight > node.clientHeight + 2) return node;
+      if (node === main) break;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function footerTop() {
+    const footer = document.querySelector("#main footer");
+    if (!footer) return window.innerHeight;
+    return footer.getBoundingClientRect().top;
+  }
+
+  function animationFrame() {
+    return new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+
+  async function settleRect(element) {
+    let previous = "";
+    for (let frame = 0; frame < 10; frame += 1) {
+      await animationFrame();
+      const rect = element.getBoundingClientRect();
+      const next = `${Math.round(rect.top)}:${Math.round(rect.bottom)}`;
+      if (frame > 0 && next === previous) return;
+      previous = next;
+    }
+  }
+
+  async function revealMessage(element) {
+    const margin = 12;
+    const scroller = messageScroller(element);
+    const rect = element.getBoundingClientRect();
+    const paneTop = scroller ? scroller.getBoundingClientRect().top : 0;
+    const topLimit = paneTop + margin;
+    const bottomLimit = footerTop() - margin;
+    const fullyVisible = rect.width > 0 && rect.height > 0 && rect.top >= topLimit && rect.bottom <= bottomLimit;
+    let delta = 0;
+    if (rect.bottom > bottomLimit) delta = rect.bottom - bottomLimit;
+    else if (rect.top < topLimit) delta = rect.top - topLimit;
+    if (!fullyVisible && scroller && Math.abs(delta) >= 1) {
+      scroller.scrollTop = Math.max(0, scroller.scrollTop + delta);
+    }
+    await settleRect(element);
+  }
+
   function clickPoint(element, button) {
     const rect = element.getBoundingClientRect();
     const x = Math.round(rect.left + rect.width / 2);
@@ -689,8 +802,26 @@
     return { x, y };
   }
 
-  async function trustedClick(element, button) {
-    const point = clickPoint(element, button);
+  function rightClickPoint(element) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 4 || rect.height < 4) return null;
+    const x = Math.round(rect.left + rect.width / 2);
+    const preferred = rect.top + Math.min(Math.max(rect.height / 2, 8), 18);
+    const inset = Math.min(4, rect.height / 2);
+    const minY = rect.top + inset;
+    const maxY = Math.min(rect.bottom - inset, footerTop() - 8);
+    if (maxY < minY) return null;
+    return { x, y: Math.round(Math.max(minY, Math.min(preferred, maxY))) };
+  }
+
+  function pointHitsMessage(element, point) {
+    const hit = document.elementFromPoint(point.x, point.y);
+    if (!hit || !element.contains(hit)) return false;
+    const footer = document.querySelector("#main footer");
+    return !footer || !footer.contains(hit);
+  }
+
+  async function dispatchTrustedClick(point, button) {
     const response = await chrome.runtime.sendMessage({
       type: "DEBUGGER_CLICK",
       x: point.x,
@@ -698,6 +829,28 @@
       button
     });
     if (!response?.ok) throw new Error(response?.error || "Could not click in WhatsApp");
+  }
+
+  async function trustedClick(element, button) {
+    await dispatchTrustedClick(clickPoint(element, button), button);
+  }
+
+  async function rightClickMessage(element) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await revealMessage(element);
+      const point = rightClickPoint(element);
+      if (point && pointHitsMessage(element, point)) {
+        await dispatchTrustedClick(point, "right");
+        return true;
+      }
+      const scroller = messageScroller(element);
+      if (!scroller) return false;
+      const before = scroller.scrollTop;
+      scroller.scrollTop = before + 36;
+      await settleRect(element);
+      if (scroller.scrollTop === before) return false;
+    }
+    return false;
   }
 
   function replyMenuItem() {
@@ -723,19 +876,18 @@
   async function quoteMessage(message) {
     const bubble = messageBubble(message);
     if (!bubble) return false;
-    bubble.scrollIntoView({ block: "center", inline: "nearest" });
 
     const attached = await chrome.runtime.sendMessage({ type: "DEBUGGER_ATTACH" });
     if (!attached?.ok) return false;
     await sleep(400);
 
     try {
-      await trustedClick(bubble, "right");
-      let reply = await waitFor(() => replyMenuItem(), 1500);
+      const opened = await rightClickMessage(bubble);
+      let reply = opened ? await waitFor(() => replyMenuItem(), 1500) : null;
       const container = bubble.closest('[data-testid="msg-container"]');
       if (!reply && container && container !== bubble) {
-        await trustedClick(container, "right");
-        reply = await waitFor(() => replyMenuItem(), 800);
+        const retried = await rightClickMessage(container);
+        if (retried) reply = await waitFor(() => replyMenuItem(), 800);
       }
       if (!reply) {
         closeQuoteMenu();
@@ -769,50 +921,62 @@
     return normalizeName(typedText(element)) === normalizeName(text);
   }
 
-  function clearBox(element) {
-    element.focus();
-    const quote = quotedBlock(element);
-    const lexical = [...element.querySelectorAll('[data-lexical-text="true"]')].filter((node) => !quote || !quote.contains(node));
-    const selection = window.getSelection();
-    const range = document.createRange();
-    if (lexical.length) {
-      range.setStartBefore(lexical[0]);
-      range.setEndAfter(lexical[lexical.length - 1]);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand("delete", false, null);
-    } else if (!quote) {
-      range.selectNodeContents(element);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand("selectAll", false, null);
-      document.execCommand("delete", false, null);
-    } else {
-      return;
-    }
-    if (normalizeName(typedText(element)) && !quote) {
-      element.textContent = "";
-      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+  async function sendDebuggerKey(key, code, keyCode, modifiers) {
+    const response = await chrome.runtime.sendMessage({
+      type: "DEBUGGER_KEY",
+      key,
+      code,
+      keyCode,
+      modifiers
+    });
+    if (!response?.ok) throw new Error(response?.error || "Could not type in WhatsApp");
+  }
+
+  function liveCompose(element, fallback) {
+    if (element && document.contains(element)) return element;
+    return composeBox() || fallback || null;
+  }
+
+  async function replaceComposeText(element, text) {
+    const box = element || composeBox();
+    if (!box) return false;
+    const attached = await chrome.runtime.sendMessage({ type: "DEBUGGER_ATTACH" });
+    if (!attached?.ok) throw new Error(attached?.error || "Could not control the WhatsApp message box");
+    try {
+      await dispatchTrustedClick(clickPoint(box, "left"), "left");
+      await sleep(150);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const live = liveCompose(element, box);
+        if (!live || !normalizeName(typedText(live))) break;
+        await sendDebuggerKey("a", "KeyA", 65, 2);
+        await sleep(60);
+        await sendDebuggerKey("Backspace", "Backspace", 8, 0);
+        await sleep(120);
+      }
+      const cleared = liveCompose(element, box);
+      if (!cleared || normalizeName(typedText(cleared))) return false;
+      if (!text) return true;
+      const inserted = await chrome.runtime.sendMessage({ type: "DEBUGGER_TEXT", text });
+      if (!inserted?.ok) throw new Error(inserted?.error || "Could not type in WhatsApp");
+      await sleep(150);
+      return boxMatches(liveCompose(element, cleared), text);
+    } finally {
+      chrome.runtime.sendMessage({ type: "DEBUGGER_DETACH" }).catch(() => {});
     }
   }
 
   async function fillBox(element, text) {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      clearBox(element);
-      await sleep(80);
-      element.focus();
-      if (!quotedBlock(element)) document.execCommand("selectAll", false, null);
-      const inserted = document.execCommand("insertText", false, text);
-      if (!inserted) {
-        element.dispatchEvent(
-          new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text })
-        );
-        document.execCommand("insertText", false, text);
-      }
-      await sleep(80);
-      if (boxMatches(element, text)) return true;
+    return replaceComposeText(element, text);
+  }
+
+  function composeSendButton() {
+    const footer = document.querySelector("#main footer");
+    if (!footer) return null;
+    const buttons = footer.querySelectorAll('button[aria-label="Send"], [role="button"][aria-label="Send"]');
+    for (const button of buttons) {
+      if (button.getAttribute("aria-label") === "Send" && isVisible(button)) return button;
     }
-    return false;
+    return null;
   }
 
   async function typeAndSend(text) {
@@ -821,16 +985,26 @@
     const filled = await fillBox(box, text);
     const current = composeBox() || box;
     if (!filled || !boxMatches(current, text)) {
-      clearBox(current);
+      const leftover = normalizeName(typedText(current));
+      if (leftover && leftover !== normalizeName(text)) {
+        throw new Error("Could not clear the WhatsApp message box");
+      }
       throw new Error("The WhatsApp message box did not contain the reply");
     }
-    const send = await waitFor(() => findSendButton(), 5000);
-    if (!send) throw new Error("Could not find the WhatsApp send button");
-    if (!boxMatches(composeBox() || box, text)) {
-      clearBox(composeBox() || box);
+    const send = await waitFor(() => {
+      const live = composeBox();
+      if (!live || !boxMatches(live, text)) return null;
+      return composeSendButton();
+    }, 5000);
+    const readyBox = composeBox() || box;
+    const readySend = composeSendButton();
+    if (!boxMatches(readyBox, text)) {
       throw new Error("The WhatsApp message box did not contain the reply");
     }
-    clickElement(send);
+    if (!send || !readySend || readySend.getAttribute("aria-label") !== "Send") {
+      throw new Error("Could not find the WhatsApp send button");
+    }
+    clickElement(readySend);
   }
 
   async function replyToClaim(message, text) {
@@ -845,9 +1019,30 @@
     await replyToClaim(message, ACK_TEXT);
   }
 
-  async function sendTextMessage(groupName, text) {
+  function findClaimMessage(claimText) {
+    const wanted = normalizeName(claimText);
+    const messages = chatMessages();
+    if (!wanted) return messages[messages.length - 1] || null;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (normalizeName(messages[index].text).includes(wanted)) return messages[index];
+    }
+    return null;
+  }
+
+  async function sendTextMessage(groupName, text, quoteText) {
     await withDetectionPaused(async () => {
       await openGroup(groupName);
+      const quote = normalizeName(quoteText);
+      if (quote) {
+        const target = await waitFor(() => findClaimMessage(quote), 4000);
+        if (target) {
+          try {
+            await quoteMessage(target);
+          } catch (error) {
+            closeQuoteMenu();
+          }
+        }
+      }
       await typeAndSend(text);
     }, text);
   }
@@ -866,24 +1061,28 @@
     return null;
   }
 
-  async function finishPdfSend(caption, send) {
-    const captionField = caption ? captionBox() : null;
-    if (caption && captionField) {
-      const filled = await fillBox(captionField, caption);
-      if (!filled || !boxMatches(captionField, caption)) {
-        clearBox(captionField);
-        throw new Error("The WhatsApp caption did not match the claim number");
-      }
+  async function ensureComposeEmpty() {
+    const box = await waitFor(() => composeBox(), 8000);
+    if (!box) throw new Error("Could not find the WhatsApp message box");
+    if (!normalizeName(typedText(box))) return;
+    const cleared = await replaceComposeText(box, "");
+    if (!cleared) throw new Error("Could not clear the WhatsApp message box");
+  }
+
+  async function finishPdfSend(send) {
+    const captionField = captionBox();
+    if (captionField && normalizeName(typedText(captionField))) {
+      const cleared = await replaceComposeText(captionField, "");
+      if (!cleared) throw new Error("Could not clear the WhatsApp caption");
     }
     clickElement(findSendButton() || send);
     await sleep(400);
-    const mainBox = composeBox();
-    if (mainBox && normalizeName(typedText(mainBox))) clearBox(mainBox);
   }
 
-  async function sendPdfMessage({ base64, filename, caption, groupName }) {
+  async function sendPdfMessage({ base64, filename, groupName }) {
     await withDetectionPaused(async () => {
       await openGroup(groupName);
+      await ensureComposeEmpty();
       const file = base64ToFile(base64, filename);
       await ensureAttachMenu();
       const input = await revealDocumentInput();
@@ -891,11 +1090,81 @@
       setInputFiles(input, file);
       const send = await waitFor(() => previewReady(filename), 12000);
       if (!send) throw new Error("WhatsApp did not open the file preview");
-      await finishPdfSend(caption, send);
-    }, caption);
+      await finishPdfSend(send);
+    }, "");
+  }
+
+  async function prepareGroup(groupName) {
+    const name = normalizeName(groupName) || state.groupName;
+    state.groupName = name;
+    await openGroup(name);
+    await waitFor(() => (chatIsOpen(name) && (messageAreaReady() || chatMessages().length) ? true : null), 8000);
+    return name;
+  }
+
+  async function kickstart() {
+    state.starting = true;
+    let ready = false;
+    try {
+      await prepareGroup(state.groupName);
+      if (!state.enabled || state.testingMode) return;
+      await waitFor(() => (chatMessages().length ? true : null), 8000);
+      if (!state.enabled || state.testingMode) return;
+      const messages = chatMessages();
+      if (!messages.length) {
+        state.seeded = false;
+        state.releaseLatest = true;
+        report({ type: "STATUS", status: "No incoming message yet" });
+        return;
+      }
+      state.releaseLatest = false;
+      await forgetSeen(messages[messages.length - 1].id);
+      if (!state.enabled || state.testingMode) return;
+      await absorbVisibleMessages();
+      ready = state.enabled && !state.testingMode;
+    } finally {
+      state.starting = false;
+    }
+    if (ready) await queueCheck();
+  }
+
+  async function testDetect(groupName) {
+    const name = await prepareGroup(groupName);
+    const main = document.querySelector("#main");
+    const messages = chatMessages();
+    const result = {
+      ok: true,
+      chatOpen: chatIsOpen(name),
+      containerCount: main ? main.querySelectorAll('[data-testid="msg-container"]').length : 0,
+      messages: messages.map((message) => ({
+        text: message.text,
+        seen: state.seenIds.has(message.id)
+      }))
+    };
+    console.info("Iclaim detect:", result.messages.map((message) => message.text));
+    return result;
+  }
+
+  async function testReply(groupName, claimText) {
+    await prepareGroup(groupName);
+    const wanted = normalizeName(claimText);
+    const target = findClaimMessage(claimText);
+    if (!target) {
+      return { ok: false, error: wanted ? `No incoming message contains ${wanted}` : "No incoming message to reply to" };
+    }
+    await replyToClaim(target, "test reply");
+    return { ok: true, repliedTo: target.text };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "TEST_DETECT" || message?.type === "TEST_REPLY") {
+      const run = () =>
+        message.type === "TEST_DETECT" ? testDetect(message.groupName) : testReply(message.groupName, message.text);
+      run()
+        .then((result) => sendResponse(result))
+        .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+      return true;
+    }
     if (message?.type === "SEND_PDF") {
       sendPdfMessage(message)
         .then(() => sendResponse({ ok: true }))
@@ -903,7 +1172,7 @@
       return true;
     }
     if (message?.type === "SEND_TEXT") {
-      sendTextMessage(message.groupName, message.text)
+      sendTextMessage(message.groupName, message.text, message.quoteText)
         .then(() => sendResponse({ ok: true }))
         .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
       return true;
@@ -916,19 +1185,57 @@
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "session") {
+      if (!changes.testingMode) return;
+      const testing = changes.testingMode.newValue === true;
+      state.testingMode = testing;
+      sessionReady = true;
+      if (!testing && state.enabled) {
+        absorbVisibleMessages()
+          .catch((error) => console.info("Iclaim automation:", error))
+          .then(() => queueCheck());
+      }
+      return;
+    }
     if (area !== "local") return;
-    if (changes.enabled) state.enabled = changes.enabled.newValue !== false;
+    if (changes.enabled) {
+      const enabled = changes.enabled.newValue !== false;
+      if (enabled) pauseOnStart = false;
+      state.enabled = enabled;
+      if (!state.enabled) state.releaseLatest = false;
+      if (state.enabled) {
+        state.starting = true;
+        kickstart().catch((error) => report({ type: "STATUS", status: error.message || "Could not open the WhatsApp group" }));
+      }
+    }
     if (changes.groupName) {
       state.groupName = normalizeName(changes.groupName.newValue) || ICLAIM_DEFAULTS.groupName;
       state.seeded = false;
+      state.releaseLatest = false;
       openGroup(state.groupName)
         .then(() => queueCheck())
         .catch((error) => report({ type: "STATUS", status: error.message || "Could not open the WhatsApp group" }));
     }
   });
 
+  async function pauseWatcher() {
+    const current = await chrome.storage.local.get({ jobStatus: "" });
+    if (!pauseOnStart) return;
+    const patch = { enabled: false };
+    if (!/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) {
+      patch.jobStatus = "Paused";
+    }
+    if (!pauseOnStart) return;
+    state.enabled = false;
+    await chrome.storage.local.set(patch);
+    if (pauseOnStart || state.enabled) return;
+    state.enabled = true;
+    await chrome.storage.local.set({ enabled: true });
+  }
+
   async function start() {
     await loadSettings();
+    await pauseWatcher();
     await new Promise((resolve) => {
       if (document.querySelector("#pane-side")) {
         resolve();
@@ -945,11 +1252,6 @@
     state.armed = true;
     watchChat();
     startPoll();
-    if (state.enabled) report({ type: "WATCHING" });
-
-    await openGroup(state.groupName);
-    await waitFor(() => (chatIsOpen(state.groupName) && messageAreaReady() ? true : null), 20000);
-    await queueCheck();
   }
 
   start().catch((error) => {

@@ -413,6 +413,15 @@ function labelOf(element) {
     return best;
   }
 
+  function claimStatusOf(row) {
+    const cell = row?.querySelector("td.claim-status");
+    if (!cell) return "";
+    if (cell.classList.contains("success")) return "success";
+    if (cell.classList.contains("warning")) return "warning";
+    if (cell.classList.contains("danger")) return "danger";
+    return "";
+  }
+
   async function ensureWorklist() {
     if (!onWorklist()) location.hash = "#/requests/worklist";
     const input = await waitFor(() => document.querySelector('input[ng-model="claimsSearchText"]'), 20000);
@@ -496,6 +505,13 @@ function labelOf(element) {
     }
     const settledRows = rowsForClaim(collectRows(), text);
     const target = latestRow(settledRows.length ? settledRows : rows);
+    if (!target?.row) return { ok: false, error: `No claim found for ${text}` };
+
+    const status = claimStatusOf(target.row);
+    if (status === "warning") return { ok: true, status, reply: "Still Pending" };
+    if (status === "danger") return { ok: true, status, reply: "Follow ST. Protocol" };
+    if (status !== "success") return { ok: false, error: `Could not read the claim status for ${text}` };
+
     const hashBefore = location.hash;
     clickClaimRow(target.row);
 
@@ -514,7 +530,7 @@ function labelOf(element) {
     }
     const documentUrl = await waitFor(() => (!isBusy() ? findDocumentUrl() : ""), 20000);
     if (!documentUrl) return { ok: false, error: `Could not download the claim document for ${text}` };
-    return { ok: true, documentUrl };
+    return { ok: true, status: "success", documentUrl };
   }
 
   globalThis.__iclaimAutomation = { searchAndOpen };

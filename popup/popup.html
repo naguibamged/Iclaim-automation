@@ -18,12 +18,27 @@
     <section class="card row">
       <div>
         <span class="label">Automation</span>
-        <strong id="switch-label">On</strong>
+        <strong id="switch-label">Off</strong>
       </div>
       <label class="switch">
-        <input id="enabled" type="checkbox" checked />
+        <input id="enabled" type="checkbox" />
         <span class="slider"></span>
       </label>
+    </section>
+
+    <section class="card" id="testing-card" hidden>
+      <div id="testing-password-row" hidden>
+        <label class="label" for="testing-password">Password</label>
+        <input id="testing-password" class="field" type="password" spellcheck="false" autocomplete="off" />
+        <button id="testing-unlock" type="button">Unlock</button>
+      </div>
+      <div id="testing-panel" hidden>
+        <button id="test-detect" type="button">Detect messages</button>
+        <pre id="detect-result">No detect yet.</pre>
+        <button id="test-reply" type="button">Reply</button>
+        <button id="test-search" type="button">Search iClaim</button>
+        <button id="test-attach" type="button">Send attachment</button>
+      </div>
     </section>
 
     <section class="card">
