@@ -3,8 +3,11 @@ const BUSY_STATUS = /^(Searching|Saving|Sending|Detecting|Replying)/;
 
 const enabledEl = document.getElementById("enabled");
 const switchLabelEl = document.getElementById("switch-label");
+const backgroundEl = document.getElementById("work-in-background");
+const backgroundLabelEl = document.getElementById("background-label");
 const groupEl = document.getElementById("group-name");
 const urlEl = document.getElementById("worklist-url");
+const committeeUrlEl = document.getElementById("committee-url");
 const statusEl = document.getElementById("status");
 const resultEl = document.getElementById("result");
 const claimEl = document.getElementById("claim-number");
@@ -51,8 +54,11 @@ async function load() {
   });
   enabledEl.checked = data.enabled !== false;
   switchLabelEl.textContent = enabledEl.checked ? "On" : "Off";
+  backgroundEl.checked = data.workInBackground === true;
+  backgroundLabelEl.textContent = backgroundEl.checked ? "On" : "Off";
   groupEl.value = data.groupName || ICLAIM_DEFAULTS.groupName;
   urlEl.value = data.worklistUrl || ICLAIM_DEFAULTS.worklistUrl;
+  committeeUrlEl.value = data.committeeUrl || ICLAIM_DEFAULTS.committeeUrl;
   showStatus(data.jobStatus);
   showResult(data.lastResult);
   const session = await chrome.storage.session.get({ testingMode: false });
@@ -62,15 +68,18 @@ async function load() {
 async function saveSettings() {
   const typedGroup = groupEl.value.trim();
   const worklistUrl = urlEl.value.trim() || ICLAIM_DEFAULTS.worklistUrl;
+  const committeeUrl = committeeUrlEl.value.trim() || ICLAIM_DEFAULTS.committeeUrl;
   const enabled = enabledEl.checked;
+  const workInBackground = backgroundEl.checked;
   switchLabelEl.textContent = enabled ? "On" : "Off";
+  backgroundLabelEl.textContent = workInBackground ? "On" : "Off";
 
   const stored = await chrome.storage.local.get({
     ...ICLAIM_DEFAULTS,
     jobStatus: "Ready"
   });
   const groupName = typedGroup || stored.groupName || ICLAIM_DEFAULTS.groupName;
-  const patch = { enabled, worklistUrl };
+  const patch = { enabled, worklistUrl, committeeUrl, workInBackground };
   if (typedGroup) patch.groupName = typedGroup;
   const busy = BUSY_STATUS.test(stored.jobStatus || "");
   if (!busy) {
@@ -79,6 +88,7 @@ async function saveSettings() {
 
   await chrome.storage.local.set(patch);
   if (!urlEl.value.trim()) urlEl.value = worklistUrl;
+  if (!committeeUrlEl.value.trim()) committeeUrlEl.value = committeeUrl;
   if (!busy) showStatus(patch.jobStatus);
 }
 
@@ -101,7 +111,7 @@ function scheduleSave() {
 async function runClaim() {
   const text = claimEl.value.trim();
   if (!text) {
-    showStatus("Type an iClaim number");
+    showStatus("Type a National ID or Claim ID");
     claimEl.focus();
     return;
   }
@@ -225,7 +235,7 @@ replyEl.addEventListener("click", () => {
 searchStageEl.addEventListener("click", () => {
   const text = claimEl.value.trim();
   if (!text) {
-    showStatus("Type an iClaim number");
+    showStatus("Type a National ID or Claim ID");
     claimEl.focus();
     return;
   }
@@ -234,6 +244,10 @@ searchStageEl.addEventListener("click", () => {
 
 attachEl.addEventListener("click", () => {
   runStage("TEST_ATTACH", "Sending attachment", { text: claimEl.value.trim() }).catch((error) => showStatus(error.message));
+});
+
+backgroundEl.addEventListener("change", () => {
+  scheduleSave();
 });
 
 enabledEl.addEventListener("change", () => {
@@ -252,6 +266,7 @@ groupEl.addEventListener("blur", () => {
   restoreGroupName().catch((error) => showStatus(error.message));
 });
 urlEl.addEventListener("input", scheduleSave);
+committeeUrlEl.addEventListener("input", scheduleSave);
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "session") {
@@ -266,6 +281,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.enabled && document.activeElement !== enabledEl) {
     enabledEl.checked = changes.enabled.newValue !== false;
     switchLabelEl.textContent = enabledEl.checked ? "On" : "Off";
+  }
+  if (changes.workInBackground && document.activeElement !== backgroundEl) {
+    backgroundEl.checked = changes.workInBackground.newValue === true;
+    backgroundLabelEl.textContent = backgroundEl.checked ? "On" : "Off";
   }
 });
 

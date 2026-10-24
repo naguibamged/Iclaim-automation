@@ -26,6 +26,17 @@
       </label>
     </section>
 
+    <section class="card row">
+      <div>
+        <span class="label">Work in background</span>
+        <strong id="background-label">Off</strong>
+      </div>
+      <label class="switch">
+        <input id="work-in-background" type="checkbox" />
+        <span class="slider"></span>
+      </label>
+    </section>
+
     <section class="card" id="testing-card" hidden>
       <div id="testing-password-row" hidden>
         <label class="label" for="testing-password">Password</label>
@@ -36,14 +47,14 @@
         <button id="test-detect" type="button">Detect messages</button>
         <pre id="detect-result">No detect yet.</pre>
         <button id="test-reply" type="button">Reply</button>
-        <button id="test-search" type="button">Search iClaim</button>
+        <button id="test-search" type="button">Search</button>
         <button id="test-attach" type="button">Send attachment</button>
       </div>
     </section>
 
     <section class="card">
-      <label class="label" for="claim-number">Test iClaim number</label>
-      <input id="claim-number" class="field" type="text" spellcheck="false" placeholder="739956" />
+      <label class="label" for="claim-number">Test National ID or Claim ID</label>
+      <input id="claim-number" class="field" type="text" spellcheck="false" placeholder="739956 or 14-digit ID" />
       <button id="run-claim" type="button">Search and send</button>
     </section>
 
@@ -53,6 +64,9 @@
 
       <label class="label" for="worklist-url">iClaim worklist</label>
       <input id="worklist-url" class="field" type="text" spellcheck="false" />
+
+      <label class="label" for="committee-url">Committee site</label>
+      <input id="committee-url" class="field" type="text" spellcheck="false" />
     </section>
 
     <section class="card">

@@ -19,6 +19,8 @@
 
   let sessionReady = false;
   let pauseOnStart = true;
+  let kickStarted = false;
+  let kickPromise = null;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -434,6 +436,10 @@
     }
     if (!decision?.ok) return;
     try {
+      if (decision.validation) {
+        if (decision.reply) await replyToClaim(message, decision.reply);
+        return;
+      }
       if (decision.duplicate) {
         if (decision.reply) await replyToClaim(message, decision.reply);
       } else {
@@ -1102,37 +1108,88 @@
     return name;
   }
 
-  async function kickstart() {
+  async function readIncoming(groupName) {
+    const name = await prepareGroup(groupName);
+    const main = document.querySelector("#main");
+    const messages = chatMessages();
+    console.info("Iclaim detect:", messages.map((message) => message.text));
+    return { name, main, messages };
+  }
+
+  function requestKickstart() {
+    if (kickPromise) return kickPromise;
+    if (kickStarted) return Promise.resolve({ ok: true, already: true });
+    kickStarted = true;
+    pauseOnStart = false;
     state.starting = true;
-    let ready = false;
+    kickPromise = kickstart()
+      .catch((error) => {
+        const message = error?.message || "Could not open the WhatsApp group";
+        report({ type: "STATUS", status: message });
+        return { ok: false, error: message };
+      })
+      .finally(() => {
+        kickPromise = null;
+      });
+    return kickPromise;
+  }
+
+  async function kickstart() {
+    state.enabled = true;
+    state.testingMode = false;
+    sessionReady = true;
+    state.starting = true;
     try {
-      await prepareGroup(state.groupName);
-      if (!state.enabled || state.testingMode) return;
-      await waitFor(() => (chatMessages().length ? true : null), 8000);
-      if (!state.enabled || state.testingMode) return;
-      const messages = chatMessages();
+      try {
+        await chrome.storage.session.set({ testingMode: false });
+      } catch (error) {
+        // Testing mode is already closed when automation is turned on.
+      }
+      state.testingMode = false;
+      sessionReady = true;
+      if (!state.enabled) return { ok: false, error: "Paused" };
+      report({ type: "STATUS", status: "Detecting messages" });
+      let detected = await readIncoming(state.groupName);
+      if (!state.enabled) return { ok: false, error: "Paused" };
+      if (!detected.messages.length) {
+        await waitFor(() => (chatMessages().length ? true : null), 8000);
+        detected = {
+          name: detected.name,
+          main: document.querySelector("#main"),
+          messages: chatMessages()
+        };
+        console.info("Iclaim detect:", detected.messages.map((message) => message.text));
+      }
+      const messages = detected.messages;
       if (!messages.length) {
         state.seeded = false;
         state.releaseLatest = true;
         report({ type: "STATUS", status: "No incoming message yet" });
-        return;
+        return { ok: true, messages: [] };
       }
+      const latest = messages[messages.length - 1];
       state.releaseLatest = false;
-      await forgetSeen(messages[messages.length - 1].id);
-      if (!state.enabled || state.testingMode) return;
       await absorbVisibleMessages();
-      ready = state.enabled && !state.testingMode;
+      await forgetSeen(latest.id);
+      if (!state.enabled) return { ok: false, error: "Paused" };
+      state.testingMode = false;
+      state.seeded = true;
+      await emitMessage(latest);
+      return {
+        ok: true,
+        messages: messages.map((message) => ({
+          text: message.text,
+          seen: message.id !== latest.id && state.seenIds.has(message.id)
+        }))
+      };
     } finally {
       state.starting = false;
     }
-    if (ready) await queueCheck();
   }
 
   async function testDetect(groupName) {
-    const name = await prepareGroup(groupName);
-    const main = document.querySelector("#main");
-    const messages = chatMessages();
-    const result = {
+    const { name, main, messages } = await readIncoming(groupName);
+    return {
       ok: true,
       chatOpen: chatIsOpen(name),
       containerCount: main ? main.querySelectorAll('[data-testid="msg-container"]').length : 0,
@@ -1141,8 +1198,6 @@
         seen: state.seenIds.has(message.id)
       }))
     };
-    console.info("Iclaim detect:", result.messages.map((message) => message.text));
-    return result;
   }
 
   async function testReply(groupName, claimText) {
@@ -1157,6 +1212,20 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "KICKSTART") {
+      const run = async () => {
+        const stored = await chrome.storage.local.get({ enabled: false });
+        if (stored.enabled !== true) return { ok: false, error: "Paused" };
+        if (message.groupName) state.groupName = normalizeName(message.groupName) || state.groupName;
+        state.enabled = true;
+        pauseOnStart = false;
+        return requestKickstart();
+      };
+      run()
+        .then((result) => sendResponse(result || { ok: true }))
+        .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+      return true;
+    }
     if (message?.type === "TEST_DETECT" || message?.type === "TEST_REPLY") {
       const run = () =>
         message.type === "TEST_DETECT" ? testDetect(message.groupName) : testReply(message.groupName, message.text);
@@ -1190,7 +1259,7 @@
       const testing = changes.testingMode.newValue === true;
       state.testingMode = testing;
       sessionReady = true;
-      if (!testing && state.enabled) {
+      if (!testing && state.enabled && !state.starting) {
         absorbVisibleMessages()
           .catch((error) => console.info("Iclaim automation:", error))
           .then(() => queueCheck());
@@ -1198,20 +1267,22 @@
       return;
     }
     if (area !== "local") return;
-    if (changes.enabled) {
-      const enabled = changes.enabled.newValue !== false;
-      if (enabled) pauseOnStart = false;
-      state.enabled = enabled;
-      if (!state.enabled) state.releaseLatest = false;
-      if (state.enabled) {
-        state.starting = true;
-        kickstart().catch((error) => report({ type: "STATUS", status: error.message || "Could not open the WhatsApp group" }));
-      }
-    }
     if (changes.groupName) {
       state.groupName = normalizeName(changes.groupName.newValue) || ICLAIM_DEFAULTS.groupName;
       state.seeded = false;
       state.releaseLatest = false;
+    }
+    if (changes.enabled) {
+      const enabled = changes.enabled.newValue !== false;
+      if (enabled) pauseOnStart = false;
+      state.enabled = enabled;
+      if (!state.enabled) {
+        state.releaseLatest = false;
+        kickStarted = false;
+      }
+      if (state.enabled) requestKickstart();
+    }
+    if (changes.groupName && state.enabled && !changes.enabled) {
       openGroup(state.groupName)
         .then(() => queueCheck())
         .catch((error) => report({ type: "STATUS", status: error.message || "Could not open the WhatsApp group" }));

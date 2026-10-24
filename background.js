@@ -34,7 +34,9 @@ async function getSettings() {
   return {
     enabled: data.enabled !== false,
     groupName: String(data.groupName || ICLAIM_DEFAULTS.groupName).trim() || ICLAIM_DEFAULTS.groupName,
-    worklistUrl: String(data.worklistUrl || ICLAIM_DEFAULTS.worklistUrl).trim() || ICLAIM_DEFAULTS.worklistUrl
+    worklistUrl: String(data.worklistUrl || ICLAIM_DEFAULTS.worklistUrl).trim() || ICLAIM_DEFAULTS.worklistUrl,
+    committeeUrl: String(data.committeeUrl || ICLAIM_DEFAULTS.committeeUrl).trim() || ICLAIM_DEFAULTS.committeeUrl,
+    workInBackground: data.workInBackground === true
   };
 }
 
@@ -44,6 +46,8 @@ async function ensureDefaults() {
   if (typeof current.enabled !== "boolean") patch.enabled = ICLAIM_DEFAULTS.enabled;
   if (!current.groupName) patch.groupName = ICLAIM_DEFAULTS.groupName;
   if (!current.worklistUrl) patch.worklistUrl = ICLAIM_DEFAULTS.worklistUrl;
+  if (!current.committeeUrl) patch.committeeUrl = ICLAIM_DEFAULTS.committeeUrl;
+  if (typeof current.workInBackground !== "boolean") patch.workInBackground = ICLAIM_DEFAULTS.workInBackground;
   if (!current.jobStatus) patch.jobStatus = "Ready";
   if (!Array.isArray(current.processedIds)) patch.processedIds = [];
   if (!Array.isArray(current.seenMessageIds)) patch.seenMessageIds = [];
@@ -77,13 +81,14 @@ async function setClaimState(text, state) {
   await chrome.storage.session.set({ sessionClaims: claims });
 }
 
-function pdfFilename(text) {
+function pdfFilename(text, kind) {
   const clean = String(text)
     .trim()
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
     .replace(/\s+/g, " ")
     .slice(0, 80);
-  return `claim-${clean || "document"}.pdf`;
+  const prefix = kind === "national" ? "decision" : "claim";
+  return `${prefix}-${clean || "document"}.pdf`;
 }
 
 function waitForTabComplete(tabId, timeout = 30000) {
@@ -121,25 +126,119 @@ async function focusTab(tab) {
   return updated;
 }
 
-async function ensureIclaimTab(worklistUrl) {
+async function ensureOriginTab(url, invalidMessage, background) {
   let origin = "";
   try {
-    origin = new URL(worklistUrl).origin;
+    origin = new URL(url).origin;
   } catch (error) {
-    throw new Error("The iClaim worklist URL in settings is not valid");
+    throw new Error(invalidMessage);
   }
 
   const tabs = await chrome.tabs.query({});
   const existing = tabs.find((tab) => tab.url && tab.url.startsWith(origin));
   if (existing) {
-    await focusTab(existing);
-    if (existing.status !== "complete") await waitForTabComplete(existing.id);
-    return existing;
+    if (!background) await focusTab(existing);
+    if (existing.discarded && background) {
+      await chrome.tabs.reload(existing.id);
+      await waitForTabComplete(existing.id);
+    } else if (existing.status !== "complete" || existing.discarded) {
+      await waitForTabComplete(existing.id);
+    }
+    return chrome.tabs.get(existing.id);
   }
 
-  const created = await chrome.tabs.create({ url: worklistUrl, active: true });
+  const created = await chrome.tabs.create({ url, active: background !== true });
   await waitForTabComplete(created.id);
   return created;
+}
+
+function ensureIclaimTab(worklistUrl, background) {
+  return ensureOriginTab(worklistUrl, "The iClaim worklist URL in settings is not valid", background);
+}
+
+function committeeQueryUrl(committeeUrl) {
+  const url = new URL(committeeUrl);
+  const directory = url.pathname.endsWith("/") ? url.pathname : url.pathname.replace(/[^/]*$/, "");
+  url.pathname = `${directory}RMS_QueryRequest_Branch.aspx`;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+function waitForQueryPage(tabId, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => finish(new Error("Timed out waiting for the committee query page")), timeout);
+    const onUpdated = (id, info, tab) => {
+      if (id !== tabId || info.status !== "complete") return;
+      const current = (tab && tab.url) || info.url || "";
+      if (/RMS_QueryRequest_Branch\.aspx/i.test(current)) {
+        finish();
+        return;
+      }
+      chrome.tabs.get(id).then(
+        (fresh) => {
+          if (fresh.url && /RMS_QueryRequest_Branch\.aspx/i.test(fresh.url)) finish();
+        },
+        () => {}
+      );
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+async function committeeFormReady(tabId) {
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        if (document.readyState !== "complete") return false;
+        return Boolean(
+          document.querySelector("#ContentPlaceHolder1_txtSearch") ||
+            document.querySelector("#ContentPlaceHolder1_btnAll") ||
+            document.querySelector("#ContentPlaceHolder1_btnGenral")
+        );
+      }
+    });
+    return injected?.result === true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function waitForCommitteeForm(tabId) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (await committeeFormReady(tabId)) return true;
+    await delay(250);
+  }
+  return false;
+}
+
+async function ensureCommitteeTab(committeeUrl, background) {
+  let queryUrl = "";
+  try {
+    queryUrl = committeeQueryUrl(committeeUrl);
+  } catch (error) {
+    throw new Error("The committee URL in settings is not valid");
+  }
+  const tab = await ensureOriginTab(queryUrl, "The committee URL in settings is not valid", background);
+  const queryReady = waitForQueryPage(tab.id);
+  const onQuery = tab.url && /RMS_QueryRequest_Branch\.aspx/i.test(tab.url);
+  if (onQuery) await chrome.tabs.reload(tab.id);
+  else await chrome.tabs.update(tab.id, { url: queryUrl, active: background !== true });
+  await queryReady;
+  await waitForCommitteeForm(tab.id);
+  return chrome.tabs.get(tab.id);
 }
 
 async function findWhatsAppTab() {
@@ -272,7 +371,92 @@ async function fetchPdfFromPage(tabId, documentUrl) {
   return injected?.result || { isPdf: false };
 }
 
-async function printUrlToPdf(url) {
+async function isolateDecisionForPrint(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const decision = document.querySelector("#GFG");
+        if (!decision) return;
+        const box = decision.parentElement || decision;
+        box.classList.add("committee-print-root");
+        if (document.getElementById("committee-print-style")) return;
+        const style = document.createElement("style");
+        style.id = "committee-print-style";
+        style.textContent =
+          "@media print { body * { visibility: hidden !important; } .committee-print-root, .committee-print-root * { visibility: visible !important; } .committee-print-root { position: absolute !important; left: 0 !important; top: 0 !important; width: 100% !important; background: #fff !important; } }";
+        document.head.appendChild(style);
+      }
+    });
+  } catch (error) {
+    console.info("Iclaim automation: could not isolate the decision for print", error);
+  }
+}
+
+async function printOpenTabToPdf(tabId) {
+  const target = { tabId };
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    const printed = await chrome.debugger.sendCommand(target, "Page.printToPDF", {
+      printBackground: true,
+      preferCSSPageSize: true
+    });
+    if (!printed?.data) throw new Error("Chrome did not return a PDF");
+    return printed.data;
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (error) {
+        // Already detached.
+      }
+    }
+  }
+}
+
+async function printHtmlToPdf(html, baseUrl) {
+  const safeBase = String(baseUrl || "").replace(/"/g, "");
+  const documentHtml = `<!doctype html><html dir="rtl"><head><meta charset="utf-8"><base href="${safeBase}"><style>@page{size:A4;margin:10mm}body{margin:0;background:#fff}</style></head><body>${html}</body></html>`;
+  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
+  const target = { tabId: tab.id };
+  let attached = false;
+  try {
+    await waitForTabComplete(tab.id);
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameId = tree && tree.frameTree && tree.frameTree.frame && tree.frameTree.frame.id;
+    if (!frameId) throw new Error("Chrome did not return a PDF");
+    await chrome.debugger.sendCommand(target, "Page.setDocumentContent", { frameId, html: documentHtml });
+    await delay(1200);
+    const printed = await chrome.debugger.sendCommand(target, "Page.printToPDF", {
+      printBackground: true,
+      preferCSSPageSize: true
+    });
+    if (!printed?.data) throw new Error("Chrome did not return a PDF");
+    return printed.data;
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (error) {
+        // Already detached.
+      }
+    }
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch (error) {
+      // The tab may already be closed.
+    }
+  }
+}
+
+async function printUrlToPdf(url, options) {
   const tab = await chrome.tabs.create({ url: "about:blank", active: false });
   const target = { tabId: tab.id };
   let attached = false;
@@ -288,6 +472,10 @@ async function printUrlToPdf(url) {
     await chrome.tabs.update(tab.id, { url, active: false });
     await loaded;
     await delay(1200);
+    if (options && options.isolateDecision) {
+      await isolateDecisionForPrint(tab.id);
+      await delay(300);
+    }
     const printed = await chrome.debugger.sendCommand(target, "Page.printToPDF", {
       printBackground: true,
       preferCSSPageSize: true
@@ -430,6 +618,90 @@ async function runSearch(tabId, claimNumber) {
   return injected?.result || { ok: false, error: `No claim found for ${claimNumber}` };
 }
 
+async function readCommittee(tabId, payload) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      files: ["content/committee.js"]
+    });
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [payload],
+      func: async (request) => {
+        try {
+          const api = globalThis.__committeeAutomation;
+          if (!api || typeof api.run !== "function") {
+            return { ok: false, error: "Committee automation did not start" };
+          }
+          return await api.run(request);
+        } catch (error) {
+          return { ok: false, error: error && error.message ? error.message : String(error) };
+        }
+      }
+    });
+    return injected?.result || { ok: false, error: "Committee automation did not start" };
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (/frame|context|navigation|destroyed|removed/i.test(message)) {
+      return { ok: false, navigated: true, error: message };
+    }
+    return { ok: false, error: message };
+  }
+}
+
+async function runCommitteeVisible(tabId, id) {
+  const result = await readCommittee(tabId, { method: "runVisible", id });
+  if (!result) return { ok: false, error: `No decision found for ${id}` };
+  return { ...result, tabId: result.tabId || tabId };
+}
+
+function runCommitteeHidden(tabId, id) {
+  return readCommittee(tabId, { method: "runHidden", id });
+}
+
+async function captureCommitteePdf(result, fallbackTabId, background) {
+  if (result.base64) return result.base64;
+  const tabId = result.tabId || fallbackTabId;
+  if (result.capture === "tab") {
+    await isolateDecisionForPrint(tabId);
+    await delay(300);
+    return printOpenTabToPdf(tabId);
+  }
+  if (result.documentUrl) {
+    try {
+      const fetched = await fetchPdfFromPage(tabId, result.documentUrl);
+      if (fetched?.isPdf && fetched.base64) return fetched.base64;
+    } catch (error) {
+      console.info("Iclaim automation: direct PDF fetch failed", error);
+    }
+    if (!background && tabId) {
+      await chrome.tabs.update(tabId, { url: result.documentUrl, active: true });
+      await waitForTabComplete(tabId);
+      await delay(800);
+      await isolateDecisionForPrint(tabId);
+      return printOpenTabToPdf(tabId);
+    }
+    return printUrlToPdf(result.documentUrl, { isolateDecision: true });
+  }
+  if (result.html) return printHtmlToPdf(result.html, result.baseUrl);
+  throw new Error("Could not download the committee decision");
+}
+
+async function kickstartAutomation() {
+  const settings = await getSettings();
+  if (!settings.enabled) return;
+  const tab = await findWhatsAppTab();
+  if (!tab) {
+    await setStatus("Open WhatsApp Web first");
+    return;
+  }
+  const response = await sendToWhatsApp(tab.id, { type: "KICKSTART", groupName: settings.groupName });
+  if (response?.already) return;
+  if (!response?.ok) await setStatus(response?.error || "Could not read WhatsApp messages");
+}
+
 async function testDetect() {
   const blocked = await testingGate();
   if (blocked) return blocked;
@@ -469,18 +741,30 @@ async function testSearch(claimText) {
   const blocked = await testingGate();
   if (blocked) return blocked;
   const text = String(claimText || "").trim();
-  if (!text) return failStage("Type an iClaim number");
+  if (!text) return failStage("Type a National ID or Claim ID");
+  const parsed = classifyClaimId(text);
+  if (!parsed.ok) return failStage(parsed.reply);
   const settings = await getSettings();
-  await setStatus(`Searching ${text}`);
-  const iclaimTab = await ensureIclaimTab(settings.worklistUrl);
-  const result = await runSearch(iclaimTab.id, text);
-  if (!result?.ok) return failStage(result?.error || `No claim found for ${text}`);
+  const background = settings.workInBackground === true;
+  await setStatus(`Searching ${parsed.id}`);
+  if (parsed.kind === "national") {
+    const tab = await ensureCommitteeTab(settings.committeeUrl, background);
+    const result = background ? await runCommitteeHidden(tab.id, parsed.id) : await runCommitteeVisible(tab.id, parsed.id);
+    if (!result?.ok) return failStage(result?.error || `No decision found for ${parsed.id}`);
+    const summary = result.summary || `Opened decision ${parsed.id}`;
+    await setLastResult(summary);
+    await setStatus("Search finished");
+    return { ok: true, report: summary, status: "Search finished" };
+  }
+  const iclaimTab = await ensureIclaimTab(settings.worklistUrl, background);
+  const result = await runSearch(iclaimTab.id, parsed.id);
+  if (!result?.ok) return failStage(result?.error || `No claim found for ${parsed.id}`);
   if (result.reply) {
     await setLastResult(result.reply);
     await setStatus(result.reply);
     return { ok: true, report: result.reply, status: result.reply };
   }
-  await setLastResult(result.documentUrl || `Opened claim ${text}`);
+  await setLastResult(result.documentUrl || `Opened claim ${parsed.id}`);
   await setStatus("Search finished");
   return { ok: true };
 }
@@ -508,44 +792,7 @@ async function testAttach(claimText) {
   return { ok: true };
 }
 
-async function runJob(job) {
-  const settings = await getSettings();
-  const groupName = job.groupName || settings.groupName;
-  await setStatus(`Searching ${job.text}`);
-
-  const iclaimTab = await ensureIclaimTab(settings.worklistUrl);
-  const result = await runSearch(iclaimTab.id, job.text);
-  if (!result?.ok) {
-    const error = result?.error || `No claim found for ${job.text}`;
-    await notifyWhatsApp(groupName, error);
-    await setLastResult(error);
-    await setStatus(error);
-    return false;
-  }
-
-  if (result.reply) {
-    const delivered = await notifyWhatsApp(groupName, result.reply, job.text);
-    await setLastResult(result.reply);
-    await setStatus(result.reply);
-    if (result.status === "danger" && delivered) {
-      await setClaimState(job.text, "rejected");
-      return true;
-    }
-    return false;
-  }
-
-  await setStatus(`Saving PDF for ${job.text}`);
-  let base64 = "";
-  try {
-    base64 = await capturePdf(result.documentUrl, iclaimTab.id);
-  } catch (error) {
-    const message = `Could not download the claim document for ${job.text}`;
-    await notifyWhatsApp(groupName, message);
-    await setLastResult(`${message}. ${error?.message || ""}`.trim());
-    await setStatus(message);
-    return false;
-  }
-
+async function deliverPdf(job, groupName, base64) {
   await setStatus(`Sending PDF for ${job.text}`);
   const whatsAppTab = await ensureWhatsAppTab();
   if (!whatsAppTab) {
@@ -555,7 +802,7 @@ async function runJob(job) {
     return false;
   }
 
-  const filename = pdfFilename(job.text);
+  const filename = pdfFilename(job.text, job.kind);
   const response = await sendToWhatsApp(whatsAppTab.id, {
     type: "SEND_PDF",
     base64,
@@ -575,6 +822,66 @@ async function runJob(job) {
   await setLastResult(done);
   await setStatus(`Watching ${groupName}`);
   return true;
+}
+
+async function reportFailure(groupName, quote, message, detail) {
+  await notifyWhatsApp(groupName, message, quote);
+  await setLastResult(detail ? `${message}. ${detail}`.trim() : message);
+  await setStatus(message);
+  return false;
+}
+
+async function runJob(job) {
+  const settings = await getSettings();
+  const groupName = job.groupName || settings.groupName;
+  const quote = job.quoteText || job.text;
+  const parsed =
+    job.kind === "national" || job.kind === "claim"
+      ? { ok: true, kind: job.kind, id: String(job.text || "").trim() }
+      : classifyClaimId(job.text);
+  if (!parsed.ok) return reportFailure(groupName, quote, parsed.reply);
+
+  const id = parsed.id;
+  const kind = parsed.kind;
+  const current = { ...job, text: id, kind };
+  const background = settings.workInBackground === true;
+  await setStatus(`Searching ${id}`);
+
+  if (kind === "national") {
+    const tab = await ensureCommitteeTab(settings.committeeUrl, background);
+    const result = background ? await runCommitteeHidden(tab.id, id) : await runCommitteeVisible(tab.id, id);
+    if (!result?.ok) return reportFailure(groupName, quote, result?.error || `No decision found for ${id}`);
+    await setStatus(`Saving PDF for ${id}`);
+    try {
+      const base64 = await captureCommitteePdf(result, result.tabId || tab.id, background);
+      return deliverPdf(current, groupName, base64);
+    } catch (error) {
+      return reportFailure(groupName, quote, `Could not download the committee decision for ${id}`, error?.message || "");
+    }
+  }
+
+  const iclaimTab = await ensureIclaimTab(settings.worklistUrl, background);
+  const result = await runSearch(iclaimTab.id, id);
+  if (!result?.ok) return reportFailure(groupName, quote, result?.error || `No claim found for ${id}`);
+
+  if (result.reply) {
+    const delivered = await notifyWhatsApp(groupName, result.reply, quote);
+    await setLastResult(result.reply);
+    await setStatus(result.reply);
+    if (result.status === "danger" && delivered) {
+      await setClaimState(id, "rejected");
+      return true;
+    }
+    return false;
+  }
+
+  await setStatus(`Saving PDF for ${id}`);
+  try {
+    const base64 = await capturePdf(result.documentUrl, iclaimTab.id);
+    return deliverPdf(current, groupName, base64);
+  } catch (error) {
+    return reportFailure(groupName, quote, `Could not download the claim document for ${id}`, error?.message || "");
+  }
 }
 
 async function drainQueue() {
@@ -624,31 +931,42 @@ async function reserveClaim(job) {
   const stored = await chrome.storage.local.get({ processedIds: [] });
   if ((stored.processedIds || []).includes(job.messageId)) return { ok: true, duplicate: true, reply: "" };
 
-  const state = await claimState(text);
+  const parsed = classifyClaimId(text);
+  if (!parsed.ok) {
+    await setLastResult(parsed.reply);
+    await setStatus(parsed.reply);
+    if (job.manual) return { ok: false, error: parsed.reply };
+    return { ok: true, validation: true, reply: parsed.reply };
+  }
+
+  const id = parsed.id;
+  const state = await claimState(id);
   if (state === "sent") {
-    const reply = `Already sent ${text}`;
+    const reply = `Already sent ${id}`;
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
   if (state === "rejected") {
-    const reply = `Already answered ${text}`;
+    const reply = `Already answered ${id}`;
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
   if (state === "pending") {
-    const reply = `Already getting ${text}`;
+    const reply = `Already getting ${id}`;
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
 
-  await setClaimState(text, "pending");
+  await setClaimState(id, "pending");
 
   const session = await chrome.storage.session.get({ jobQueue: [] });
   const queue = session.jobQueue || [];
   if (!queue.some((item) => item.messageId === job.messageId)) {
     queue.push({
       messageId: job.messageId,
-      text,
+      text: id,
+      quoteText: text,
+      kind: parsed.kind,
       groupName: job.groupName || settings.groupName,
       manual: job.manual === true
     });
@@ -661,6 +979,7 @@ async function reserveClaim(job) {
 async function acceptAndRun(job) {
   const decision = await reserveClaim(job);
   if (decision.start) await drainQueue();
+  return decision;
 }
 
 async function pauseOnLoad() {
@@ -724,7 +1043,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "RUN_CLAIM") {
     const text = String(message.text || "").trim();
     if (!text) {
-      sendResponse({ ok: false, error: "Type an iClaim number" });
+      sendResponse({ ok: false, error: "Type a National ID or Claim ID" });
       return true;
     }
     schedule(() =>
@@ -734,7 +1053,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         manual: true
       })
     )
-      .then(() => sendResponse({ ok: true }))
+      .then((decision) => {
+        if (decision && decision.ok === false) sendResponse(decision);
+        else sendResponse({ ok: true });
+      })
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
@@ -840,6 +1162,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.enabled && changes.enabled.newValue === true) {
+    kickstartAutomation().catch((error) => console.info("Iclaim automation:", error));
+  }
   if (area !== "session" || !changes.testingMode || changes.testingMode.newValue === true) return;
   schedule(async () => {
     await drainQueue();

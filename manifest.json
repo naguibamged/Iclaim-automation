@@ -2,11 +2,12 @@
   "manifest_version": 3,
   "name": "Iclaim Automation",
   "version": "1.0.0",
-  "description": "Watch a WhatsApp group, search iClaim, and send the claim PDF back.",
+  "description": "Watch a WhatsApp group, search iClaim or the committee site, and send the PDF back.",
   "permissions": ["storage", "tabs", "scripting", "debugger"],
   "host_permissions": [
     "https://web.whatsapp.com/*",
-    "http://41.33.97.121:1337/*"
+    "http://41.33.97.121:1337/*",
+    "http://196.219.52.208/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
