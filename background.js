@@ -29,6 +29,52 @@ function setLastResult(lastResult) {
   return chrome.storage.local.set({ lastResult });
 }
 
+const HUD_TICK_MS = 700;
+const HUD_SETTLE_MS = 800;
+
+function idleHudStage() {
+  return { label: "", phase: "idle", detail: "", at: Date.now() };
+}
+
+function setHudStage(label, phase, detail) {
+  return chrome.storage.local.set({
+    hudStage: {
+      label: label || "",
+      phase: phase || "idle",
+      detail: detail || "",
+      at: Date.now()
+    }
+  });
+}
+
+async function beginHudStage(background, label, detail) {
+  if (!background) return;
+  await setHudStage(label, "running", detail);
+}
+
+async function completeHudStage(background, label, detail) {
+  if (!background) return;
+  await setHudStage(label, "done", detail);
+  await delay(HUD_TICK_MS);
+}
+
+function hudErrorDetail(id, message) {
+  const text = String(message || "The automation stopped");
+  if (!id || text.includes(String(id))) return text;
+  return `${id} — ${text}`;
+}
+
+async function failHudStage(background, label, detail) {
+  if (!background) return;
+  await setHudStage(label, "error", detail);
+}
+
+async function settleHudStage(background) {
+  if (!background) return;
+  await delay(HUD_SETTLE_MS);
+  await setHudStage("", "idle", "");
+}
+
 async function getSettings() {
   const data = await chrome.storage.local.get(ICLAIM_DEFAULTS);
   return {
@@ -845,42 +891,121 @@ async function runJob(job) {
   const kind = parsed.kind;
   const current = { ...job, text: id, kind };
   const background = settings.workInBackground === true;
-  await setStatus(`Searching ${id}`);
+  let stageLabel = "";
 
-  if (kind === "national") {
-    const tab = await ensureCommitteeTab(settings.committeeUrl, background);
-    const result = background ? await runCommitteeHidden(tab.id, id) : await runCommitteeVisible(tab.id, id);
-    if (!result?.ok) return reportFailure(groupName, quote, result?.error || `No decision found for ${id}`);
-    await setStatus(`Saving PDF for ${id}`);
-    try {
-      const base64 = await captureCommitteePdf(result, result.tabId || tab.id, background);
-      return deliverPdf(current, groupName, base64);
-    } catch (error) {
-      return reportFailure(groupName, quote, `Could not download the committee decision for ${id}`, error?.message || "");
-    }
+  async function startStage(label) {
+    stageLabel = label;
+    await beginHudStage(background, label, id);
   }
 
-  const iclaimTab = await ensureIclaimTab(settings.worklistUrl, background);
-  const result = await runSearch(iclaimTab.id, id);
-  if (!result?.ok) return reportFailure(groupName, quote, result?.error || `No claim found for ${id}`);
+  async function failStage(label, message) {
+    await failHudStage(background, label, hudErrorDetail(id, message));
+    stageLabel = "";
+  }
 
-  if (result.reply) {
-    const delivered = await notifyWhatsApp(groupName, result.reply, quote);
-    await setLastResult(result.reply);
-    await setStatus(result.reply);
-    if (result.status === "danger" && delivered) {
-      await setClaimState(id, "rejected");
+  try {
+    await setStatus(`Searching ${id}`);
+    if (!background) await setHudStage("", "idle", "");
+
+    if (kind === "national") {
+      await startStage("Opening the committee website");
+      const tab = await ensureCommitteeTab(settings.committeeUrl, background);
+      await completeHudStage(background, "Opening the committee website", id);
+
+      await startStage("Searching for the decision");
+      const result = background ? await runCommitteeHidden(tab.id, id) : await runCommitteeVisible(tab.id, id);
+      if (!result?.ok) {
+        const message = result?.error || `No decision found for ${id}`;
+        await failStage("Searching for the decision", message);
+        return reportFailure(groupName, quote, message);
+      }
+      await completeHudStage(background, "Searching for the decision", id);
+
+      await startStage("Getting the PDF");
+      await setStatus(`Saving PDF for ${id}`);
+      let base64 = "";
+      try {
+        base64 = await captureCommitteePdf(result, result.tabId || tab.id, background);
+      } catch (error) {
+        const message = `Could not download the committee decision for ${id}`;
+        await failStage("Getting the PDF", error?.message || message);
+        return reportFailure(groupName, quote, message, error?.message || "");
+      }
+      await completeHudStage(background, "Getting the PDF", id);
+
+      await startStage("Sending the PDF");
+      const sent = await deliverPdf(current, groupName, base64);
+      if (!sent) {
+        const stored = await chrome.storage.local.get({ lastResult: "" });
+        await failStage("Sending the PDF", stored.lastResult || "Could not send the PDF");
+        return false;
+      }
+      await completeHudStage(background, "Sending the PDF", id);
+      stageLabel = "";
+      await settleHudStage(background);
       return true;
     }
-    return false;
-  }
 
-  await setStatus(`Saving PDF for ${id}`);
-  try {
-    const base64 = await capturePdf(result.documentUrl, iclaimTab.id);
-    return deliverPdf(current, groupName, base64);
+    await startStage("Opening the iClaim website");
+    const iclaimTab = await ensureIclaimTab(settings.worklistUrl, background);
+    await completeHudStage(background, "Opening the iClaim website", id);
+
+    await startStage("Searching for the claim");
+    const result = await runSearch(iclaimTab.id, id);
+    if (!result?.ok) {
+      const message = result?.error || `No claim found for ${id}`;
+      await failStage("Searching for the claim", message);
+      return reportFailure(groupName, quote, message);
+    }
+    await completeHudStage(background, "Searching for the claim", id);
+
+    if (result.reply) {
+      await startStage("Replying on WhatsApp");
+      const delivered = await notifyWhatsApp(groupName, result.reply, quote);
+      await setLastResult(result.reply);
+      await setStatus(result.reply);
+      if (!delivered) {
+        await failStage("Replying on WhatsApp", "Could not send the WhatsApp reply");
+        return false;
+      }
+      await completeHudStage(background, "Replying on WhatsApp", id);
+      stageLabel = "";
+      await settleHudStage(background);
+      if (result.status === "danger") {
+        await setClaimState(id, "rejected");
+        return true;
+      }
+      return false;
+    }
+
+    await startStage("Getting the PDF");
+    await setStatus(`Saving PDF for ${id}`);
+    let base64 = "";
+    try {
+      base64 = await capturePdf(result.documentUrl, iclaimTab.id);
+    } catch (error) {
+      const message = `Could not download the claim document for ${id}`;
+      await failStage("Getting the PDF", error?.message || message);
+      return reportFailure(groupName, quote, message, error?.message || "");
+    }
+    await completeHudStage(background, "Getting the PDF", id);
+
+    await startStage("Sending the PDF");
+    const sent = await deliverPdf(current, groupName, base64);
+    if (!sent) {
+      const stored = await chrome.storage.local.get({ lastResult: "" });
+      await failStage("Sending the PDF", stored.lastResult || "Could not send the PDF");
+      return false;
+    }
+    await completeHudStage(background, "Sending the PDF", id);
+    stageLabel = "";
+    await settleHudStage(background);
+    return true;
   } catch (error) {
-    return reportFailure(groupName, quote, `Could not download the claim document for ${id}`, error?.message || "");
+    if (background && stageLabel) {
+      await failStage(stageLabel, error?.message || "The automation stopped");
+    }
+    throw error;
   }
 }
 
@@ -983,6 +1108,7 @@ async function acceptAndRun(job) {
 }
 
 async function pauseOnLoad() {
+  await chrome.storage.local.set({ workInBackground: false, hudStage: idleHudStage() });
   const current = await chrome.storage.local.get({ jobStatus: "" });
   if (/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) return;
   await chrome.storage.local.set({ enabled: false, jobStatus: "Paused" });
