@@ -6,7 +6,57 @@ var ICLAIM_DEFAULTS = {
   workInBackground: false
 };
 
-var ICLAIM_INVALID_ID_REPLY = "please send valid National ID or Claim ID";
+var ICLAIM_REPLY_DEFAULTS = {
+  ack: "getting the IClaim",
+  stillPending: "Still Pending",
+  followProtocol: "Follow ST. Protocol",
+  alreadySent: "Already sent {id}",
+  alreadyAnswered: "Already answered {id}",
+  alreadyGetting: "Already getting {id}",
+  invalidId: "please send valid National ID or Claim ID",
+  noClaim: "No claim found for {id}",
+  noDecision: "No decision found for {id}",
+  committeeRefusal: "{status}",
+  committeeCorrection: "{status}",
+  committeeOther: "{status}"
+};
+
+var ICLAIM_REPLY_FIELDS = [
+  { key: "ack", label: "Getting the claim" },
+  { key: "stillPending", label: "Still pending" },
+  { key: "followProtocol", label: "Follow protocol" },
+  { key: "alreadySent", label: "Already sent" },
+  { key: "alreadyAnswered", label: "Already answered" },
+  { key: "alreadyGetting", label: "Already getting" },
+  { key: "invalidId", label: "Invalid ID" },
+  { key: "noClaim", label: "No claim" },
+  { key: "noDecision", label: "No decision" },
+  { key: "committeeRefusal", label: "Committee refusal" },
+  { key: "committeeCorrection", label: "Committee correction" },
+  { key: "committeeOther", label: "Other committee status" }
+];
+
+var ICLAIM_INVALID_ID_REPLY = ICLAIM_REPLY_DEFAULTS.invalidId;
+
+function replyVariants(raw, fallback) {
+  const fallbackText = String(fallback || "");
+  const source = raw == null || String(raw).trim() === "" ? fallbackText : String(raw);
+  const parts = source.split(/[,،]/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length) return parts;
+  const fallbackParts = fallbackText.split(/[,،]/).map((part) => part.trim()).filter(Boolean);
+  return fallbackParts.length ? fallbackParts : [fallbackText];
+}
+
+function pickReply(templates, key, vars) {
+  const defaults = ICLAIM_REPLY_DEFAULTS[key] || "";
+  const stored = templates && typeof templates === "object" ? templates[key] : "";
+  const list = replyVariants(stored, defaults);
+  const choice = list[Math.floor(Math.random() * list.length)] || defaults;
+  const values = vars || {};
+  return choice
+    .replace(/\{id\}/g, values.id == null ? "" : String(values.id))
+    .replace(/\{status\}/g, values.status == null ? "" : String(values.status));
+}
 
 function toLatinDigits(value) {
   return String(value || "").replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)));

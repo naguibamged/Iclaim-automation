@@ -103,6 +103,13 @@ button {
   cursor: pointer;
 }
 
+button.ghost {
+  margin-top: 2px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--line);
+}
+
 button:disabled {
   opacity: 0.6;
   cursor: default;

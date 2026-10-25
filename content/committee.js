@@ -110,8 +110,9 @@
     const value = text.replace(/\s+/g, " ").trim();
     if (!value) return { ok: false, error: `Could not read the decision status for ${id}` };
     if (/^accept$/i.test(value)) return null;
-    if (/^(refusal|correction)$/i.test(value)) return { ok: true, reply: text, status: "danger" };
-    return { ok: true, reply: text, status: "warning" };
+    if (/^refusal$/i.test(value)) return { ok: true, replyKey: "committeeRefusal", status: "danger", statusText: text };
+    if (/^correction$/i.test(value)) return { ok: true, replyKey: "committeeCorrection", status: "danger", statusText: text };
+    return { ok: true, replyKey: "committeeOther", status: "warning", statusText: text };
   }
 
   function findSearchButton(doc, field) {
@@ -268,13 +269,13 @@
         if (rows.length) {
           const row = pickLatest(ctx.doc);
           const select = row && row.querySelector(SELECTOR);
-          if (!select) return { ok: false, error: `No decision found for ${id}` };
+          if (!select) return { ok: true, replyKey: "noDecision" };
           const reply = decisionReply(row, id);
           if (reply) return reply;
           const selected = await press(select);
           if (selected) return pdfResult(selected, id);
         } else if (!ctx.doc.querySelector("#ContentPlaceHolder1_btnPrint")) {
-          return { ok: false, error: `No decision found for ${id}` };
+          return { ok: true, replyKey: "noDecision" };
         }
 
         return finishFromPrint(id);
@@ -385,13 +386,13 @@
       if (rows.length) {
         const row = pickLatest(doc);
         const select = row && row.querySelector(SELECTOR);
-        if (!select) return { ok: false, error: `No decision found for ${id}` };
+        if (!select) return { ok: true, replyKey: "noDecision" };
         const reply = decisionReply(row, id);
         if (reply) return reply;
         const selected = await press(select);
         if (selected) return pdfResult(selected);
       } else if (!query("#ContentPlaceHolder1_btnPrint")) {
-        return { ok: false, error: `No decision found for ${id}` };
+        return { ok: true, replyKey: "noDecision" };
       }
 
       const printButton = query("#ContentPlaceHolder1_btnPrint");

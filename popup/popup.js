@@ -22,6 +22,7 @@ const detectResultEl = document.getElementById("detect-result");
 const replyEl = document.getElementById("test-reply");
 const searchStageEl = document.getElementById("test-search");
 const attachEl = document.getElementById("test-attach");
+const repliesEl = document.getElementById("open-replies");
 const stageButtons = [detectEl, replyEl, searchStageEl, attachEl];
 
 function watchingLabel(groupName) {
@@ -186,6 +187,10 @@ claimEl.addEventListener("keydown", (event) => {
 
 runEl.addEventListener("click", () => {
   runClaim();
+});
+
+repliesEl.addEventListener("click", () => {
+  chrome.runtime.openOptionsPage();
 });
 
 function isTestingShortcut(event) {

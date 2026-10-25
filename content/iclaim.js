@@ -498,18 +498,18 @@ function labelOf(element) {
     const finished = await waitForSearchToFinish();
     if (!finished) return { ok: false, error: `iClaim is still loading results for ${text}` };
     const rows = await waitForResults(previousSignature, text);
-    if (!rows.length) return { ok: false, error: `No claim found for ${text}` };
+    if (!rows.length) return { ok: true, replyKey: "noClaim" };
 
     if (!(await waitUntilNotBusy())) {
       return { ok: false, error: `iClaim is still loading results for ${text}` };
     }
     const settledRows = rowsForClaim(collectRows(), text);
     const target = latestRow(settledRows.length ? settledRows : rows);
-    if (!target?.row) return { ok: false, error: `No claim found for ${text}` };
+    if (!target?.row) return { ok: true, replyKey: "noClaim" };
 
     const status = claimStatusOf(target.row);
-    if (status === "warning") return { ok: true, status, reply: "Still Pending" };
-    if (status === "danger") return { ok: true, status, reply: "Follow ST. Protocol" };
+    if (status === "warning") return { ok: true, status, replyKey: "stillPending" };
+    if (status === "danger") return { ok: true, status, replyKey: "followProtocol" };
     if (status !== "success") return { ok: false, error: `Could not read the claim status for ${text}` };
 
     const hashBefore = location.hash;

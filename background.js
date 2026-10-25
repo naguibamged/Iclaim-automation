@@ -64,8 +64,7 @@ function hudErrorDetail(id, message) {
   return `${id} — ${text}`;
 }
 
-async function failHudStage(background, label, detail) {
-  if (!background) return;
+async function failHudStage(label, detail) {
   await setHudStage(label, "error", detail);
 }
 
@@ -76,14 +75,30 @@ async function settleHudStage(background) {
 }
 
 async function getSettings() {
-  const data = await chrome.storage.local.get(ICLAIM_DEFAULTS);
+  const data = await chrome.storage.local.get({
+    ...ICLAIM_DEFAULTS,
+    replyTemplates: {}
+  });
+  const templates = data.replyTemplates;
   return {
     enabled: data.enabled !== false,
     groupName: String(data.groupName || ICLAIM_DEFAULTS.groupName).trim() || ICLAIM_DEFAULTS.groupName,
     worklistUrl: String(data.worklistUrl || ICLAIM_DEFAULTS.worklistUrl).trim() || ICLAIM_DEFAULTS.worklistUrl,
     committeeUrl: String(data.committeeUrl || ICLAIM_DEFAULTS.committeeUrl).trim() || ICLAIM_DEFAULTS.committeeUrl,
-    workInBackground: data.workInBackground === true
+    workInBackground: data.workInBackground === true,
+    replyTemplates: templates && typeof templates === "object" && !Array.isArray(templates) ? templates : {}
   };
+}
+
+function chatReplyText(templates, result, id) {
+  if (!result) return "";
+  if (result.replyKey) {
+    return pickReply(templates, result.replyKey, {
+      id,
+      status: result.statusText || ""
+    });
+  }
+  return result.reply || "";
 }
 
 async function ensureDefaults() {
@@ -638,6 +653,7 @@ async function testingGate() {
 }
 
 async function failStage(message) {
+  await setHudStage("Stopped", "error", message);
   await setLastResult(message);
   await setStatus(message);
   return { ok: false, error: message };
@@ -721,7 +737,7 @@ async function runSearch(tabId, claimNumber) {
       }
     }
   });
-  return injected?.result || { ok: false, error: `No claim found for ${claimNumber}` };
+  return injected?.result || { ok: false, error: "iClaim automation did not start" };
 }
 
 async function readCommittee(tabId, payload) {
@@ -759,7 +775,7 @@ async function readCommittee(tabId, payload) {
 
 async function runCommitteeVisible(tabId, id) {
   const result = await readCommittee(tabId, { method: "runVisible", id });
-  if (!result) return { ok: false, error: `No decision found for ${id}` };
+  if (!result) return { ok: false, error: "Committee automation did not start" };
   return { ...result, tabId: result.tabId || tabId };
 }
 
@@ -857,10 +873,11 @@ async function testSearch(claimText) {
     const tab = await ensureCommitteeTab(settings.committeeUrl, background);
     const result = background ? await runCommitteeHidden(tab.id, parsed.id) : await runCommitteeVisible(tab.id, parsed.id);
     if (!result?.ok) return failStage(result?.error || `No decision found for ${parsed.id}`);
-    if (result.reply) {
-      await setLastResult(result.reply);
-      await setStatus(result.reply);
-      return { ok: true, report: result.reply, status: result.reply };
+    const replyText = chatReplyText(settings.replyTemplates, result, parsed.id);
+    if (replyText) {
+      await setLastResult(replyText);
+      await setStatus(replyText);
+      return { ok: true, report: replyText, status: replyText };
     }
     const summary = result.summary || `Opened decision ${parsed.id}`;
     await setLastResult(summary);
@@ -870,10 +887,11 @@ async function testSearch(claimText) {
   const iclaimTab = await ensureIclaimTab(settings.worklistUrl, background);
   const result = await runSearch(iclaimTab.id, parsed.id);
   if (!result?.ok) return failStage(result?.error || `No claim found for ${parsed.id}`);
-  if (result.reply) {
-    await setLastResult(result.reply);
-    await setStatus(result.reply);
-    return { ok: true, report: result.reply, status: result.reply };
+  const claimReply = chatReplyText(settings.replyTemplates, result, parsed.id);
+  if (claimReply) {
+    await setLastResult(claimReply);
+    await setStatus(claimReply);
+    return { ok: true, report: claimReply, status: claimReply };
   }
   await setLastResult(result.documentUrl || `Opened claim ${parsed.id}`);
   await setStatus("Search finished");
@@ -935,9 +953,11 @@ async function deliverPdf(job, groupName, base64) {
   return true;
 }
 
-async function reportFailure(groupName, quote, message, detail) {
-  await notifyWhatsApp(groupName, message, quote);
-  await setLastResult(detail ? `${message}. ${detail}`.trim() : message);
+async function reportFailure(label, id, message, detail) {
+  const combined = detail ? `${message}. ${detail}`.trim() : message;
+  const text = hudErrorDetail(id, combined);
+  await setHudStage(label || "Stopped", "error", text);
+  await setLastResult(text);
   await setStatus(message);
   return false;
 }
@@ -950,7 +970,13 @@ async function runJob(job) {
     job.kind === "national" || job.kind === "claim"
       ? { ok: true, kind: job.kind, id: String(job.text || "").trim() }
       : classifyClaimId(job.text);
-  if (!parsed.ok) return reportFailure(groupName, quote, parsed.reply);
+  if (!parsed.ok) {
+    const reply = pickReply(settings.replyTemplates, "invalidId");
+    await notifyWhatsApp(groupName, reply, quote);
+    await setLastResult(reply);
+    await setStatus(reply);
+    return false;
+  }
 
   const id = parsed.id;
   const kind = parsed.kind;
@@ -964,8 +990,29 @@ async function runJob(job) {
   }
 
   async function failStage(label, message) {
-    await failHudStage(background, label, hudErrorDetail(id, message));
+    await failHudStage(label, hudErrorDetail(id, message));
     stageLabel = "";
+  }
+
+  async function sendChatReply(result) {
+    const replyText = chatReplyText(settings.replyTemplates, result, id);
+    if (!replyText) return null;
+    await startStage("Replying on WhatsApp");
+    const delivered = await notifyWhatsApp(groupName, replyText, quote);
+    await setLastResult(replyText);
+    await setStatus(replyText);
+    if (!delivered) {
+      await failStage("Replying on WhatsApp", "Could not send the WhatsApp reply");
+      return false;
+    }
+    await completeHudStage(background, "Replying on WhatsApp", id);
+    stageLabel = "";
+    await settleHudStage(background);
+    if (result.status === "danger") {
+      await setClaimState(id, "rejected");
+      return true;
+    }
+    return false;
   }
 
   try {
@@ -982,28 +1029,12 @@ async function runJob(job) {
       if (!result?.ok) {
         const message = result?.error || `No decision found for ${id}`;
         await failStage("Searching for the decision", message);
-        return reportFailure(groupName, quote, message);
+        return reportFailure("Searching for the decision", id, message);
       }
       await completeHudStage(background, "Searching for the decision", id);
 
-      if (result.reply) {
-        await startStage("Replying on WhatsApp");
-        const delivered = await notifyWhatsApp(groupName, result.reply, quote);
-        await setLastResult(result.reply);
-        await setStatus(result.reply);
-        if (!delivered) {
-          await failStage("Replying on WhatsApp", "Could not send the WhatsApp reply");
-          return false;
-        }
-        await completeHudStage(background, "Replying on WhatsApp", id);
-        stageLabel = "";
-        await settleHudStage(background);
-        if (result.status === "danger") {
-          await setClaimState(id, "rejected");
-          return true;
-        }
-        return false;
-      }
+      const committeeAnswer = await sendChatReply(result);
+      if (committeeAnswer !== null) return committeeAnswer;
 
       await startStage("Getting the PDF");
       await setStatus(`Saving PDF for ${id}`);
@@ -1013,7 +1044,7 @@ async function runJob(job) {
       } catch (error) {
         const message = `Could not download the committee decision for ${id}`;
         await failStage("Getting the PDF", error?.message || message);
-        return reportFailure(groupName, quote, message, error?.message || "");
+        return reportFailure("Getting the PDF", id, message, error?.message || "");
       }
       await completeHudStage(background, "Getting the PDF", id);
 
@@ -1039,28 +1070,12 @@ async function runJob(job) {
     if (!result?.ok) {
       const message = result?.error || `No claim found for ${id}`;
       await failStage("Searching for the claim", message);
-      return reportFailure(groupName, quote, message);
+      return reportFailure("Searching for the claim", id, message);
     }
     await completeHudStage(background, "Searching for the claim", id);
 
-    if (result.reply) {
-      await startStage("Replying on WhatsApp");
-      const delivered = await notifyWhatsApp(groupName, result.reply, quote);
-      await setLastResult(result.reply);
-      await setStatus(result.reply);
-      if (!delivered) {
-        await failStage("Replying on WhatsApp", "Could not send the WhatsApp reply");
-        return false;
-      }
-      await completeHudStage(background, "Replying on WhatsApp", id);
-      stageLabel = "";
-      await settleHudStage(background);
-      if (result.status === "danger") {
-        await setClaimState(id, "rejected");
-        return true;
-      }
-      return false;
-    }
+    const claimAnswer = await sendChatReply(result);
+    if (claimAnswer !== null) return claimAnswer;
 
     await startStage("Getting the PDF");
     await setStatus(`Saving PDF for ${id}`);
@@ -1070,7 +1085,7 @@ async function runJob(job) {
     } catch (error) {
       const message = `Could not download the claim document for ${id}`;
       await failStage("Getting the PDF", error?.message || message);
-      return reportFailure(groupName, quote, message, error?.message || "");
+      return reportFailure("Getting the PDF", id, message, error?.message || "");
     }
     await completeHudStage(background, "Getting the PDF", id);
 
@@ -1086,9 +1101,9 @@ async function runJob(job) {
     await settleHudStage(background);
     return true;
   } catch (error) {
-    if (background && stageLabel) {
-      await failStage(stageLabel, error?.message || "The automation stopped");
-    }
+    const message = error?.message || "The automation stopped";
+    if (stageLabel) await failStage(stageLabel, message);
+    else await setHudStage("Stopped", "error", message);
     throw error;
   }
 }
@@ -1142,26 +1157,27 @@ async function reserveClaim(job) {
 
   const parsed = classifyClaimId(text);
   if (!parsed.ok) {
-    await setLastResult(parsed.reply);
-    await setStatus(parsed.reply);
-    if (job.manual) return { ok: false, error: parsed.reply };
-    return { ok: true, validation: true, reply: parsed.reply };
+    const reply = pickReply(settings.replyTemplates, "invalidId");
+    await setLastResult(reply);
+    await setStatus(reply);
+    if (job.manual) return { ok: false, error: reply };
+    return { ok: true, validation: true, reply };
   }
 
   const id = parsed.id;
   const state = await claimState(id);
   if (state === "sent") {
-    const reply = `Already sent ${id}`;
+    const reply = pickReply(settings.replyTemplates, "alreadySent", { id });
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
   if (state === "rejected") {
-    const reply = `Already answered ${id}`;
+    const reply = pickReply(settings.replyTemplates, "alreadyAnswered", { id });
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
   if (state === "pending") {
-    const reply = `Already getting ${id}`;
+    const reply = pickReply(settings.replyTemplates, "alreadyGetting", { id });
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }

@@ -3,7 +3,6 @@
   globalThis.__iclaimWhatsAppInstalled = true;
 
   const SEEN_LIMIT = 200;
-  const ACK_TEXT = "getting the IClaim";
   const state = {
     enabled: false,
     groupName: ICLAIM_DEFAULTS.groupName,
@@ -51,6 +50,17 @@
     return String(value || "").replace(/\s+/g, " ").trim();
   }
 
+  let ackVariants = [];
+
+  function rememberAckVariants(templates) {
+    ackVariants = replyVariants(templates && templates.ack, ICLAIM_REPLY_DEFAULTS.ack).map((text) => normalizeName(text));
+  }
+
+  function isAckText(text) {
+    if (!ackVariants.length) rememberAckVariants(null);
+    return ackVariants.includes(normalizeName(text));
+  }
+
   function report(message) {
     chrome.runtime.sendMessage(message).catch(() => {});
   }
@@ -64,8 +74,9 @@
   }
 
   async function loadSettings() {
-    const data = await chrome.storage.local.get(ICLAIM_DEFAULTS);
+    const data = await chrome.storage.local.get({ ...ICLAIM_DEFAULTS, replyTemplates: {} });
     state.groupName = normalizeName(data.groupName) || ICLAIM_DEFAULTS.groupName;
+    rememberAckVariants(data.replyTemplates);
     const seen = await chrome.storage.local.get({ seenMessageIds: [] });
     for (const id of seen.seenMessageIds || []) state.seenIds.add(id);
     await refreshTestingMode();
@@ -394,10 +405,6 @@
 
   function freshMessages() {
     return chatMessages().filter((message) => !state.seenIds.has(message.id));
-  }
-
-  function isAckText(text) {
-    return normalizeName(text) === normalizeName(ACK_TEXT);
   }
 
   function takeOwnText(text) {
@@ -1022,7 +1029,9 @@
   }
 
   async function acknowledgeClaim(message) {
-    await replyToClaim(message, ACK_TEXT);
+    const data = await chrome.storage.local.get({ replyTemplates: {} });
+    rememberAckVariants(data.replyTemplates);
+    await replyToClaim(message, pickReply(data.replyTemplates, "ack"));
   }
 
   function findClaimMessage(claimText) {
@@ -1267,6 +1276,7 @@
       return;
     }
     if (area !== "local") return;
+    if (changes.replyTemplates) rememberAckVariants(changes.replyTemplates.newValue);
     if (changes.groupName) {
       state.groupName = normalizeName(changes.groupName.newValue) || ICLAIM_DEFAULTS.groupName;
       state.seeded = false;
