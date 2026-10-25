@@ -93,6 +93,27 @@
     return rows[best];
   }
 
+  function statusTextOf(row) {
+    const table = row && row.closest("table");
+    if (!table) return "";
+    const headRow = [...table.querySelectorAll("tr")].find((tr) =>
+      [...tr.children].some((cell) => (cell.textContent || "").includes("حالة الطلب"))
+    );
+    if (!headRow) return "";
+    const index = [...headRow.children].findIndex((cell) => (cell.textContent || "").includes("حالة الطلب"));
+    const cell = [...row.children][index];
+    return ((cell && cell.textContent) || "").replace(/\u00a0/g, " ").trim();
+  }
+
+  function decisionReply(row, id) {
+    const text = statusTextOf(row);
+    const value = text.replace(/\s+/g, " ").trim();
+    if (!value) return { ok: false, error: `Could not read the decision status for ${id}` };
+    if (/^accept$/i.test(value)) return null;
+    if (/^(refusal|correction)$/i.test(value)) return { ok: true, reply: text, status: "danger" };
+    return { ok: true, reply: text, status: "warning" };
+  }
+
   function findSearchButton(doc, field) {
     for (let parent = field.parentElement; parent; parent = parent.parentElement) {
       const match = /WebForm_FireDefaultButton\(\s*event\s*,\s*['"]([^'"]+)['"]/.exec(parent.getAttribute("onkeypress") || "");
@@ -248,6 +269,8 @@
           const row = pickLatest(ctx.doc);
           const select = row && row.querySelector(SELECTOR);
           if (!select) return { ok: false, error: `No decision found for ${id}` };
+          const reply = decisionReply(row, id);
+          if (reply) return reply;
           const selected = await press(select);
           if (selected) return pdfResult(selected, id);
         } else if (!ctx.doc.querySelector("#ContentPlaceHolder1_btnPrint")) {
@@ -363,6 +386,8 @@
         const row = pickLatest(doc);
         const select = row && row.querySelector(SELECTOR);
         if (!select) return { ok: false, error: `No decision found for ${id}` };
+        const reply = decisionReply(row, id);
+        if (reply) return reply;
         const selected = await press(select);
         if (selected) return pdfResult(selected);
       } else if (!query("#ContentPlaceHolder1_btnPrint")) {

@@ -172,7 +172,7 @@ async function focusTab(tab) {
   return updated;
 }
 
-async function ensureOriginTab(url, invalidMessage, background) {
+async function ensureOriginTab(url, invalidMessage, background, options = {}) {
   let origin = "";
   try {
     origin = new URL(url).origin;
@@ -183,6 +183,9 @@ async function ensureOriginTab(url, invalidMessage, background) {
   const tabs = await chrome.tabs.query({});
   const existing = tabs.find((tab) => tab.url && tab.url.startsWith(origin));
   if (existing) {
+    // Activating a discarded tab reloads it. Skip that when the caller is about
+    // to load a different address, or a form-post page shows "Resubmit the form?".
+    if (options.skipReload) return chrome.tabs.get(existing.id);
     if (!background) await focusTab(existing);
     if (existing.discarded && background) {
       await chrome.tabs.reload(existing.id);
@@ -195,7 +198,7 @@ async function ensureOriginTab(url, invalidMessage, background) {
 
   const created = await chrome.tabs.create({ url, active: background !== true });
   await waitForTabComplete(created.id);
-  return created;
+  return chrome.tabs.get(created.id);
 }
 
 function ensureIclaimTab(worklistUrl, background) {
@@ -209,6 +212,52 @@ function committeeQueryUrl(committeeUrl) {
   url.search = "";
   url.hash = "";
   return url.href;
+}
+
+function freshCommitteeQueryUrl(queryUrl) {
+  const url = new URL(queryUrl);
+  url.searchParams.set("iclaim", String(Date.now()));
+  url.hash = "";
+  return url.href;
+}
+
+function sameDocumentUrl(left, right) {
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    a.hash = "";
+    b.hash = "";
+    return a.href === b.href;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function replaceCommitteeQueryUrl(tabId, queryUrl) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [queryUrl],
+      func: (clean) => {
+        if (!/RMS_QueryRequest_Branch\.aspx/i.test(location.pathname)) return;
+        history.replaceState(null, "", clean);
+        const form = document.getElementById("form1") || document.forms[0];
+        const action = form && form.getAttribute("action");
+        if (!form || !action) return;
+        try {
+          const target = new URL(action, clean);
+          target.searchParams.delete("iclaim");
+          const query = target.searchParams.toString();
+          form.setAttribute("action", `${target.pathname}${query ? `?${query}` : ""}`);
+        } catch (error) {
+          // Keep the action the page rendered.
+        }
+      }
+    });
+  } catch (error) {
+    // The search page is already open. A leftover nonce does not block the search.
+  }
 }
 
 function waitForQueryPage(tabId, timeout = 30000) {
@@ -277,13 +326,24 @@ async function ensureCommitteeTab(committeeUrl, background) {
   } catch (error) {
     throw new Error("The committee URL in settings is not valid");
   }
-  const tab = await ensureOriginTab(queryUrl, "The committee URL in settings is not valid", background);
-  const queryReady = waitForQueryPage(tab.id);
-  const onQuery = tab.url && /RMS_QueryRequest_Branch\.aspx/i.test(tab.url);
-  if (onQuery) await chrome.tabs.reload(tab.id);
-  else await chrome.tabs.update(tab.id, { url: queryUrl, active: background !== true });
-  await queryReady;
+  // Search results and the print page are both form posts on this site. Reloading
+  // that page, or going back to it, makes Chrome show "Resubmit the form?" and the
+  // run stops. A new address is always a GET, including after a refusal that never
+  // left the results page.
+  const freshUrl = freshCommitteeQueryUrl(queryUrl);
+  const active = background !== true;
+  const tab = await ensureOriginTab(freshUrl, "The committee URL in settings is not valid", background, {
+    skipReload: true
+  });
+  const openedFresh = tab.status === "complete" && sameDocumentUrl(tab.url, freshUrl);
+  if (!openedFresh) {
+    const queryReady = waitForQueryPage(tab.id);
+    await chrome.tabs.update(tab.id, { url: freshUrl, active });
+    await queryReady;
+  }
   await waitForCommitteeForm(tab.id);
+  await replaceCommitteeQueryUrl(tab.id, queryUrl);
+  if (!background) await focusTab(await chrome.tabs.get(tab.id));
   return chrome.tabs.get(tab.id);
 }
 
@@ -797,6 +857,11 @@ async function testSearch(claimText) {
     const tab = await ensureCommitteeTab(settings.committeeUrl, background);
     const result = background ? await runCommitteeHidden(tab.id, parsed.id) : await runCommitteeVisible(tab.id, parsed.id);
     if (!result?.ok) return failStage(result?.error || `No decision found for ${parsed.id}`);
+    if (result.reply) {
+      await setLastResult(result.reply);
+      await setStatus(result.reply);
+      return { ok: true, report: result.reply, status: result.reply };
+    }
     const summary = result.summary || `Opened decision ${parsed.id}`;
     await setLastResult(summary);
     await setStatus("Search finished");
@@ -920,6 +985,25 @@ async function runJob(job) {
         return reportFailure(groupName, quote, message);
       }
       await completeHudStage(background, "Searching for the decision", id);
+
+      if (result.reply) {
+        await startStage("Replying on WhatsApp");
+        const delivered = await notifyWhatsApp(groupName, result.reply, quote);
+        await setLastResult(result.reply);
+        await setStatus(result.reply);
+        if (!delivered) {
+          await failStage("Replying on WhatsApp", "Could not send the WhatsApp reply");
+          return false;
+        }
+        await completeHudStage(background, "Replying on WhatsApp", id);
+        stageLabel = "";
+        await settleHudStage(background);
+        if (result.status === "danger") {
+          await setClaimState(id, "rejected");
+          return true;
+        }
+        return false;
+      }
 
       await startStage("Getting the PDF");
       await setStatus(`Saving PDF for ${id}`);
