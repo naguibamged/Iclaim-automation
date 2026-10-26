@@ -17,4 +17,7 @@ param(
     [switch]$Updated
 )
 
+$testPath = Join-Path $Dest 'extender-test.txt'
+Set-Content -LiteralPath $testPath -Value 'this the update extender text file' -Encoding UTF8
+
 exit 0
