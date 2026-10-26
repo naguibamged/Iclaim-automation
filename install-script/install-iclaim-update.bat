@@ -2,7 +2,7 @@
 setlocal
 
 :: ====================================================================
-:: Silent unpacked-extension updater
+:: Unpacked-extension updater
 ::
 :: Extracts IclaimUpdate.ps1, downloads the public main branch into
 :: Documents\Iclaim-automation, and registers a hidden logon task that
@@ -26,7 +26,7 @@ if %errorLevel% NEQ 0 (
 :: ====================================================================
 :: 2. EXTRACT THE POWERSHELL SCRIPT
 :: ====================================================================
-echo Setting up silent Iclaim extension updater...
+echo Setting up Iclaim extension updater...
 
 set "TasksDir=%APPDATA%\CustomScripts\IclaimUpdate"
 set "PS1Path=%TasksDir%\IclaimUpdate.ps1"
@@ -343,7 +343,8 @@ if ($InstallMode) {
         Invoke-UpdaterExt -Result $result
 
         Write-Host '2/2: Creating scheduled task...' -ForegroundColor Cyan
-        $TaskName = 'SilentIclaimUpdate'
+        Unregister-ScheduledTask -TaskName 'SilentIclaimUpdate' -Confirm:$false -ErrorAction SilentlyContinue
+        $TaskName = 'IclaimUpdate'
         $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' `
             -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -RunUpdate"
         $Trigger = New-ScheduledTaskTrigger -AtLogOn
