@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Iclaim Automation",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Watch a WhatsApp group, search iClaim or the committee site, and send the PDF back.",
   "permissions": ["storage", "tabs", "scripting", "debugger"],
   "host_permissions": [
