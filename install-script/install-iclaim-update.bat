@@ -220,7 +220,7 @@ function Update-Extension {
                     if ($InstallMode) {
                         Write-Host "Already at version $localVersion." -ForegroundColor Green
                     }
-                    return
+                    return New-UpdateResult -Dest $dest -Updated $false -LocalVersion $localVersion -RemoteVersion $remoteParsed
                 }
                 if ($InstallMode) {
                     Write-Host "Remote version $remoteParsed is newer than $localVersion. Downloading..." -ForegroundColor Cyan
@@ -235,7 +235,7 @@ function Update-Extension {
             if ($InstallMode) {
                 Write-Host "Extension is at version $installed." -ForegroundColor Green
             }
-            return
+            return New-UpdateResult -Dest $dest -Updated $true -LocalVersion $localVersion -RemoteVersion $installed
         } catch {
             $lastError = $_.Exception.Message
             Write-UpdateLog "Attempt $attempt of $AttemptCount failed: $lastError"
@@ -252,12 +252,71 @@ function Update-Extension {
     throw $lastError
 }
 
+function New-UpdateResult {
+    param(
+        [string]$Dest,
+        [bool]$Updated,
+        $LocalVersion,
+        $RemoteVersion
+    )
+
+    return [pscustomobject]@{
+        Dest = $Dest
+        Updated = $Updated
+        LocalVersion = $LocalVersion
+        RemoteVersion = $RemoteVersion
+    }
+}
+
+function Invoke-UpdaterExt {
+    param($Result)
+
+    try {
+        if (-not $Result -or -not $Result.Dest) {
+            Write-UpdateLog 'Updater extender skipped because the update result had no destination.'
+            return
+        }
+
+        $extender = Join-Path (Join-Path $Result.Dest 'install-script') 'updater-ext.ps1'
+        if (-not (Test-Path -LiteralPath $extender)) {
+            Write-UpdateLog 'No updater-ext.ps1 in the extension folder.'
+            return
+        }
+
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$extender`" -Dest `"$($Result.Dest)`" -LogPath `"$LogPath`""
+        if ($Result.LocalVersion) {
+            $arguments += " -LocalVersion `"$($Result.LocalVersion)`""
+        }
+        if ($Result.RemoteVersion) {
+            $arguments += " -RemoteVersion `"$($Result.RemoteVersion)`""
+        }
+        if ($Result.Updated) {
+            $arguments += ' -Updated'
+        }
+
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = 'PowerShell.exe'
+        $startInfo.Arguments = $arguments
+        $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $startInfo.CreateNoWindow = $true
+        $startInfo.UseShellExecute = $false
+        $proc = [System.Diagnostics.Process]::Start($startInfo)
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            Write-UpdateLog "updater-ext.ps1 exited with code $($proc.ExitCode)."
+        }
+    } catch {
+        Write-UpdateLog ("updater-ext.ps1 could not be started: " + $_.Exception.Message)
+    }
+}
+
 # ====================================================================
 # UPDATE (Task Scheduler, and any run without -InstallMode)
 # ====================================================================
 if ($RunUpdate -or -not $InstallMode) {
     try {
-        Update-Extension
+        $result = Update-Extension
+        Invoke-UpdaterExt -Result $result
         exit 0
     } catch {
         $failed = $_.Exception.Message
@@ -280,7 +339,8 @@ if ($InstallMode) {
 
         Write-Host '1/2: Saving destination and downloading the extension...' -ForegroundColor Cyan
         @{ dest = $dest } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
-        Update-Extension
+        $result = Update-Extension
+        Invoke-UpdaterExt -Result $result
 
         Write-Host '2/2: Creating scheduled task...' -ForegroundColor Cyan
         $TaskName = 'SilentIclaimUpdate'

@@ -1,5 +1,3 @@
-//this is a a comment for testing the update scrip
-
 var ICLAIM_DEFAULTS = {
   enabled: false,
   groupName: "Iclaim automation",
