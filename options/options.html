@@ -15,6 +15,21 @@
           <p>Separate alternatives with commas. One is chosen at random. <code>{id}</code> is the number. <code>{status}</code> is the committee status text.</p>
         </div>
       </header>
+      <section class="card" id="controls">
+        <div class="row">
+          <div>
+            <span class="label">Ignore other messages</span>
+            <strong id="ignore-label">Off</strong>
+          </div>
+          <label class="switch">
+            <input id="ignore-invalid" type="checkbox" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <label class="label" for="ack-gap">Reply gap (seconds)</label>
+        <input id="ack-gap" class="field" type="number" min="0" step="1" value="0" />
+        <p class="hint">0 sends every enabled reply. A higher number skips replies marked In gap when the next message arrives inside that many seconds. The claim or decision is still fetched.</p>
+      </section>
       <section class="card" id="fields"></section>
       <p id="saved" class="saved" hidden>Saved</p>
     </main>

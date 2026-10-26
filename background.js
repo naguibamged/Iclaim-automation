@@ -77,15 +77,23 @@ async function settleHudStage(background) {
 async function getSettings() {
   const data = await chrome.storage.local.get({
     ...ICLAIM_DEFAULTS,
-    replyTemplates: {}
+    replyTemplates: {},
+    replyEnabled: {},
+    replyInGap: {},
+    ackReplies: true
   });
   const templates = data.replyTemplates;
+  const flags = normalizeReplyFlags(data);
   return {
     enabled: data.enabled !== false,
     groupName: String(data.groupName || ICLAIM_DEFAULTS.groupName).trim() || ICLAIM_DEFAULTS.groupName,
     worklistUrl: String(data.worklistUrl || ICLAIM_DEFAULTS.worklistUrl).trim() || ICLAIM_DEFAULTS.worklistUrl,
     committeeUrl: String(data.committeeUrl || ICLAIM_DEFAULTS.committeeUrl).trim() || ICLAIM_DEFAULTS.committeeUrl,
     workInBackground: data.workInBackground === true,
+    ignoreInvalid: data.ignoreInvalid === true,
+    ackGapSeconds: gapSeconds(data.ackGapSeconds),
+    replyEnabled: flags.replyEnabled,
+    replyInGap: flags.replyInGap,
     replyTemplates: templates && typeof templates === "object" && !Array.isArray(templates) ? templates : {}
   };
 }
@@ -109,10 +117,22 @@ async function ensureDefaults() {
   if (!current.worklistUrl) patch.worklistUrl = ICLAIM_DEFAULTS.worklistUrl;
   if (!current.committeeUrl) patch.committeeUrl = ICLAIM_DEFAULTS.committeeUrl;
   if (typeof current.workInBackground !== "boolean") patch.workInBackground = ICLAIM_DEFAULTS.workInBackground;
+  if (typeof current.ignoreInvalid !== "boolean") patch.ignoreInvalid = ICLAIM_DEFAULTS.ignoreInvalid;
+  if (typeof current.ackGapSeconds !== "number") patch.ackGapSeconds = ICLAIM_DEFAULTS.ackGapSeconds;
+  const flags = normalizeReplyFlags(current);
+  const storedEnabled = flagObject(current.replyEnabled);
+  const storedGap = flagObject(current.replyInGap);
+  if (!sameReplyFlags(storedEnabled, flags.replyEnabled)) patch.replyEnabled = flags.replyEnabled;
+  if (!sameReplyFlags(storedGap, flags.replyInGap)) patch.replyInGap = flags.replyInGap;
   if (!current.jobStatus) patch.jobStatus = "Ready";
   if (!Array.isArray(current.processedIds)) patch.processedIds = [];
   if (!Array.isArray(current.seenMessageIds)) patch.seenMessageIds = [];
   if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+  if (typeof current.ackReplies === "boolean") await chrome.storage.local.remove("ackReplies");
+}
+
+function sameReplyFlags(stored, normalized) {
+  return ICLAIM_REPLY_FIELDS.every((field) => stored[field.key] === normalized[field.key]);
 }
 
 function claimKey(text) {
@@ -971,6 +991,7 @@ async function runJob(job) {
       ? { ok: true, kind: job.kind, id: String(job.text || "").trim() }
       : classifyClaimId(job.text);
   if (!parsed.ok) {
+    if (!shouldSendReply(settings, "invalidId", job.withinGap === true)) return false;
     const reply = pickReply(settings.replyTemplates, "invalidId");
     await notifyWhatsApp(groupName, reply, quote);
     await setLastResult(reply);
@@ -995,6 +1016,15 @@ async function runJob(job) {
   }
 
   async function sendChatReply(result) {
+    const key = result && result.replyKey;
+    if (key && !shouldSendReply(settings, key, job.withinGap === true)) {
+      await setStatus(`Watching ${groupName}`);
+      if (result.status === "danger") {
+        await setClaimState(id, "rejected");
+        return true;
+      }
+      return false;
+    }
     const replyText = chatReplyText(settings.replyTemplates, result, id);
     if (!replyText) return null;
     await startStage("Replying on WhatsApp");
@@ -1157,27 +1187,27 @@ async function reserveClaim(job) {
 
   const parsed = classifyClaimId(text);
   if (!parsed.ok) {
+    if (settings.ignoreInvalid && !job.manual) return { ok: true, ignored: true };
     const reply = pickReply(settings.replyTemplates, "invalidId");
+    if (job.manual) {
+      await setLastResult(reply);
+      await setStatus(reply);
+      return { ok: false, error: reply };
+    }
+    const withinGap = await noteMessageGap(settings);
+    if (!shouldSendReply(settings, "invalidId", withinGap)) return { ok: true, validation: true, reply: "" };
     await setLastResult(reply);
     await setStatus(reply);
-    if (job.manual) return { ok: false, error: reply };
     return { ok: true, validation: true, reply };
   }
 
   const id = parsed.id;
+  const withinGap = job.manual ? false : await noteMessageGap(settings);
   const state = await claimState(id);
-  if (state === "sent") {
-    const reply = pickReply(settings.replyTemplates, "alreadySent", { id });
-    await setStatus(reply);
-    return { ok: true, duplicate: true, reply };
-  }
-  if (state === "rejected") {
-    const reply = pickReply(settings.replyTemplates, "alreadyAnswered", { id });
-    await setStatus(reply);
-    return { ok: true, duplicate: true, reply };
-  }
-  if (state === "pending") {
-    const reply = pickReply(settings.replyTemplates, "alreadyGetting", { id });
+  if (state === "sent" || state === "rejected" || state === "pending") {
+    const key = state === "sent" ? "alreadySent" : state === "rejected" ? "alreadyAnswered" : "alreadyGetting";
+    if (!shouldSendReply(settings, key, withinGap)) return { ok: true, duplicate: true, reply: "" };
+    const reply = pickReply(settings.replyTemplates, key, { id });
     await setStatus(reply);
     return { ok: true, duplicate: true, reply };
   }
@@ -1193,12 +1223,24 @@ async function reserveClaim(job) {
       quoteText: text,
       kind: parsed.kind,
       groupName: job.groupName || settings.groupName,
-      manual: job.manual === true
+      manual: job.manual === true,
+      withinGap
     });
     await chrome.storage.session.set({ jobQueue: queue });
   }
 
-  return { ok: true, start: true };
+  const ack = !job.manual && shouldSendReply(settings, "ack", withinGap);
+  return { ok: true, start: true, ack };
+}
+
+async function noteMessageGap(settings) {
+  const now = Date.now();
+  const session = await chrome.storage.session.get({ lastClaimAt: 0 });
+  const last = Number(session.lastClaimAt) || 0;
+  const gapMs = settings.ackGapSeconds * 1000;
+  const withinGap = gapMs > 0 && last > 0 && now - last <= gapMs;
+  await chrome.storage.session.set({ lastClaimAt: now });
+  return withinGap;
 }
 
 async function acceptAndRun(job) {

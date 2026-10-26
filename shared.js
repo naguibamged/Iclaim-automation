@@ -3,7 +3,9 @@ var ICLAIM_DEFAULTS = {
   groupName: "Iclaim automation",
   worklistUrl: "http://41.33.97.121:1337/#/requests/worklist",
   committeeUrl: "http://196.219.52.208/ReuestMedicine/Home.aspx",
-  workInBackground: false
+  workInBackground: false,
+  ignoreInvalid: false,
+  ackGapSeconds: 0
 };
 
 var ICLAIM_REPLY_DEFAULTS = {
@@ -56,6 +58,36 @@ function pickReply(templates, key, vars) {
   return choice
     .replace(/\{id\}/g, values.id == null ? "" : String(values.id))
     .replace(/\{status\}/g, values.status == null ? "" : String(values.status));
+}
+
+function gapSeconds(value) {
+  const gap = Number(value);
+  if (!Number.isFinite(gap) || gap < 0) return 0;
+  return Math.floor(gap);
+}
+
+function flagObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value;
+}
+
+function normalizeReplyFlags(data) {
+  const storedEnabled = flagObject(data && data.replyEnabled);
+  const storedGap = flagObject(data && data.replyInGap);
+  const replyEnabled = {};
+  const replyInGap = {};
+  for (const field of ICLAIM_REPLY_FIELDS) {
+    if (typeof storedEnabled[field.key] === "boolean") replyEnabled[field.key] = storedEnabled[field.key];
+    else replyEnabled[field.key] = !(field.key === "ack" && data && data.ackReplies === false);
+    replyInGap[field.key] = typeof storedGap[field.key] === "boolean" ? storedGap[field.key] : field.key === "ack";
+  }
+  return { replyEnabled, replyInGap };
+}
+
+function shouldSendReply(settings, key, withinGap) {
+  if (!settings || !settings.replyEnabled || settings.replyEnabled[key] === false) return false;
+  if (withinGap && settings.replyInGap && settings.replyInGap[key] === true) return false;
+  return true;
 }
 
 function toLatinDigits(value) {

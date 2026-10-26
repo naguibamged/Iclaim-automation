@@ -441,7 +441,7 @@
       console.info("Iclaim automation:", error);
       return;
     }
-    if (!decision?.ok) return;
+    if (!decision?.ok || decision.ignored) return;
     try {
       if (decision.validation) {
         if (decision.reply) await replyToClaim(message, decision.reply);
@@ -449,7 +449,7 @@
       }
       if (decision.duplicate) {
         if (decision.reply) await replyToClaim(message, decision.reply);
-      } else {
+      } else if (decision.ack) {
         await acknowledgeClaim(message);
       }
     } catch (error) {
