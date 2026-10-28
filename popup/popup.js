@@ -1,5 +1,5 @@
 const TESTING_PASSWORD = "105090";
-const BUSY_STATUS = /^(Searching|Saving|Sending|Detecting|Replying)/;
+const BUSY_STATUS = /^(Searching|Saving|Sending|Detecting|Replying|Choose)/;
 
 const enabledEl = document.getElementById("enabled");
 const switchLabelEl = document.getElementById("switch-label");

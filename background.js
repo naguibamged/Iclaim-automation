@@ -1194,7 +1194,7 @@ async function reserveClaim(job) {
       await setStatus(reply);
       return { ok: false, error: reply };
     }
-    const withinGap = await noteMessageGap(settings);
+    const withinGap = await claimGap(settings, job);
     if (!shouldSendReply(settings, "invalidId", withinGap)) return { ok: true, validation: true, reply: "" };
     await setLastResult(reply);
     await setStatus(reply);
@@ -1202,7 +1202,7 @@ async function reserveClaim(job) {
   }
 
   const id = parsed.id;
-  const withinGap = job.manual ? false : await noteMessageGap(settings);
+  const withinGap = await claimGap(settings, job);
   const state = await claimState(id);
   if (state === "sent" || state === "rejected" || state === "pending") {
     const key = state === "sent" ? "alreadySent" : state === "rejected" ? "alreadyAnswered" : "alreadyGetting";
@@ -1243,6 +1243,13 @@ async function noteMessageGap(settings) {
   return withinGap;
 }
 
+async function claimGap(settings, job) {
+  if (job.manual) return false;
+  const withinGap = await noteMessageGap(settings);
+  if (job.batchFollowup && settings.ackGapSeconds > 0) return true;
+  return withinGap;
+}
+
 async function acceptAndRun(job) {
   const decision = await reserveClaim(job);
   if (decision.start) await drainQueue();
@@ -1266,7 +1273,7 @@ async function markWatching() {
   const session = await chrome.storage.session.get({ jobQueue: [] });
   if ((session.jobQueue || []).length) return;
   const current = await chrome.storage.local.get({ jobStatus: "" });
-  if (/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) return;
+  if (/^(Searching|Saving|Sending|Detecting|Replying|Choose)/.test(current.jobStatus || "")) return;
   await setStatus(`Watching ${settings.groupName}`);
 }
 
@@ -1334,7 +1341,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       reserveClaim({
         messageId: message.messageId,
         text: message.text,
-        groupName: message.groupName
+        groupName: message.groupName,
+        batchFollowup: message.batchFollowup === true
       })
     )
       .then((decision) => sendResponse(decision))

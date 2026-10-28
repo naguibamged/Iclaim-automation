@@ -20,6 +20,8 @@
   let pauseOnStart = true;
   let kickStarted = false;
   let kickPromise = null;
+  let kickGeneration = 0;
+  let chooserSession = null;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -129,6 +131,22 @@
     const ids = data.seenMessageIds || [];
     const next = ids.filter((item) => item !== id);
     if (next.length !== ids.length) await chrome.storage.local.set({ seenMessageIds: next });
+  }
+
+  async function persistSeenIds(ids) {
+    const fresh = [];
+    for (const id of ids) {
+      if (!id || state.seenIds.has(id)) continue;
+      state.seenIds.add(id);
+      fresh.push(id);
+    }
+    if (!fresh.length) return;
+    const data = await chrome.storage.local.get({ seenMessageIds: [] });
+    const stored = data.seenMessageIds || [];
+    for (const id of fresh) {
+      if (!stored.includes(id)) stored.push(id);
+    }
+    await chrome.storage.local.set({ seenMessageIds: stored.slice(-SEEN_LIMIT) });
   }
 
   function conversationHeader() {
@@ -374,6 +392,12 @@
     return raw.replace(/\s+\d{1,2}:\d{2}(?:\s*[ap]m)?$/i, "");
   }
 
+  function messageTime(node) {
+    const plain = node.querySelector("[data-pre-plain-text]")?.getAttribute("data-pre-plain-text") || "";
+    const match = /^\[([^\]]+)\]/.exec(plain);
+    return match ? normalizeName(match[1]) : "";
+  }
+
   function messageIdentity(node) {
     const scope = messageScope(node);
     const dataId = scope?.getAttribute("data-id") || node.getAttribute("data-id") || "";
@@ -390,7 +414,7 @@
     if (!id) return null;
     const text = messageText(node);
     if (!text) return null;
-    return { id, text };
+    return { id, text, time: messageTime(node) };
   }
 
   function chatMessages() {
@@ -415,37 +439,42 @@
     return true;
   }
 
-  async function emitMessage(message) {
+  function chosenJobId() {
+    return `chosen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  async function emitMessage(message, options = {}) {
     if (!sessionReady) await refreshTestingMode();
-    if (state.testingMode) return;
-    if (!state.enabled || !message?.id || !message.text) return;
+    if (state.testingMode) return null;
+    if (!state.enabled || !message?.id || !message.text) return null;
     if (isAckText(message.text) || takeOwnText(message.text)) {
       if (!state.seenIds.has(message.id)) {
         state.seenIds.add(message.id);
         await persistEmitted(message.id);
       }
-      return;
+      return null;
     }
-    if (state.seenIds.has(message.id)) return;
+    if (state.seenIds.has(message.id)) return null;
     state.seenIds.add(message.id);
     await persistEmitted(message.id);
     let decision = null;
     try {
       decision = await chrome.runtime.sendMessage({
         type: "RESERVE_CLAIM",
-        messageId: message.id,
+        messageId: options.replay ? chosenJobId() : message.id,
         text: message.text,
-        groupName: state.groupName
+        groupName: state.groupName,
+        batchFollowup: options.batchFollowup === true
       });
     } catch (error) {
       console.info("Iclaim automation:", error);
-      return;
+      return null;
     }
-    if (!decision?.ok || decision.ignored) return;
+    if (!decision?.ok || decision.ignored) return decision || null;
     try {
       if (decision.validation) {
         if (decision.reply) await replyToClaim(message, decision.reply);
-        return;
+        return decision;
       }
       if (decision.duplicate) {
         if (decision.reply) await replyToClaim(message, decision.reply);
@@ -455,13 +484,16 @@
     } catch (error) {
       console.info("Iclaim automation:", error);
     }
-    if (!decision.start) return;
-    report({
-      type: "NEW_MESSAGE",
-      messageId: message.id,
-      text: message.text,
-      groupName: state.groupName
-    });
+    if (!decision.start) return decision;
+    if (!options.deferDrain) {
+      report({
+        type: "NEW_MESSAGE",
+        messageId: message.id,
+        text: message.text,
+        groupName: state.groupName
+      });
+    }
+    return decision;
   }
 
   function markSentTextSeen(sentText) {
@@ -1126,24 +1158,396 @@
   }
 
   function requestKickstart() {
-    if (kickPromise) return kickPromise;
+    if (kickStarted && kickPromise) return kickPromise;
     if (kickStarted) return Promise.resolve({ ok: true, already: true });
+    const previous = kickPromise;
     kickStarted = true;
     pauseOnStart = false;
+    const generation = ++kickGeneration;
     state.starting = true;
-    kickPromise = kickstart()
+    const run = (async () => {
+      if (previous) await previous.catch(() => {});
+      if (generation !== kickGeneration || !state.enabled) return { ok: true, cancelled: true };
+      return kickstart(generation);
+    })()
       .catch((error) => {
         const message = error?.message || "Could not open the WhatsApp group";
-        report({ type: "STATUS", status: message });
+        if (generation === kickGeneration) report({ type: "STATUS", status: message });
         return { ok: false, error: message };
       })
       .finally(() => {
-        kickPromise = null;
+        if (generation !== kickGeneration) return;
+        if (kickPromise === run) kickPromise = null;
+        state.starting = false;
       });
-    return kickPromise;
+    kickPromise = run;
+    return run;
   }
 
-  async function kickstart() {
+  function screenMessages() {
+    const seen = new Set();
+    const list = [];
+    for (const message of chatMessages()) {
+      if (!message?.id || seen.has(message.id)) continue;
+      seen.add(message.id);
+      list.push({
+        id: message.id,
+        text: message.text,
+        time: message.time || ""
+      });
+    }
+    return list;
+  }
+
+  function chooserItemsFrom(messages) {
+    const seen = new Set();
+    const list = [];
+    for (const message of messages) {
+      if (!message?.id || seen.has(message.id)) continue;
+      seen.add(message.id);
+      const already = state.seenIds.has(message.id);
+      list.push({
+        id: message.id,
+        text: message.text,
+        time: message.time || "",
+        seen: already,
+        checked: !already
+      });
+    }
+    return list;
+  }
+
+  function mergeChooserItems(current, visible) {
+    const result = current.map((item) => ({ ...item }));
+    const indexOf = (id) => result.findIndex((item) => item.id === id);
+    for (let i = 0; i < visible.length; i += 1) {
+      const message = visible[i];
+      const existingIndex = indexOf(message.id);
+      if (existingIndex >= 0) {
+        result[existingIndex].text = message.text;
+        if (message.time) result[existingIndex].time = message.time;
+        continue;
+      }
+      const already = state.seenIds.has(message.id);
+      const item = {
+        id: message.id,
+        text: message.text,
+        time: message.time || "",
+        seen: already,
+        checked: !already
+      };
+      let placed = false;
+      for (let next = i + 1; next < visible.length; next += 1) {
+        const anchor = indexOf(visible[next].id);
+        if (anchor >= 0) {
+          result.splice(anchor, 0, item);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        for (let prev = i - 1; prev >= 0; prev -= 1) {
+          const anchor = indexOf(visible[prev].id);
+          if (anchor >= 0) {
+            result.splice(anchor + 1, 0, item);
+            placed = true;
+            break;
+          }
+        }
+      }
+      if (!placed) result.push(item);
+    }
+    return result;
+  }
+
+  function closeChooser(result) {
+    const session = chooserSession;
+    if (!session) return;
+    chooserSession = null;
+    session.host.remove();
+    session.resolve(result || { cancelled: true });
+  }
+
+  function openChooser(messages) {
+    closeChooser({ cancelled: true });
+    const items = chooserItemsFrom(messages);
+    return new Promise((resolve) => {
+      const host = document.createElement("div");
+      host.setAttribute("data-iclaim-chooser", "1");
+      host.style.setProperty("position", "fixed", "important");
+      host.style.setProperty("top", "16px", "important");
+      host.style.setProperty("right", "16px", "important");
+      host.style.setProperty("z-index", "2147483647", "important");
+      host.style.setProperty("width", "320px", "important");
+      host.style.setProperty("max-height", "calc(100vh - 120px)", "important");
+      host.style.setProperty("margin", "0", "important");
+      host.style.setProperty("padding", "0", "important");
+      host.style.setProperty("pointer-events", "auto", "important");
+      host.style.setProperty("background", "transparent", "important");
+
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = `
+        :host { color-scheme: light; }
+        * { box-sizing: border-box; }
+        button, .card { font: 13px/1.4 "Segoe UI", sans-serif; }
+        button { border: 0; cursor: pointer; }
+        .card {
+          display: flex;
+          flex-direction: column;
+          max-height: calc(100vh - 120px);
+          padding: 12px;
+          background: #ffffff;
+          color: #10211e;
+          border: 1px solid #d7e3df;
+          border-radius: 12px;
+          box-shadow: 0 8px 24px rgba(16, 33, 30, 0.16);
+        }
+        .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .title { font-weight: 700; }
+        .count { color: #5d6f6b; font-size: 12px; }
+        .hint { margin: 6px 0 0; color: #5d6f6b; font-size: 12px; }
+        .tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+        .tools button, .watch {
+          padding: 6px 8px;
+          border-radius: 8px;
+          background: #f4f7f6;
+          color: #10211e;
+        }
+        .list {
+          margin: 10px 0 0;
+          padding: 0;
+          list-style: none;
+          overflow: auto;
+          min-height: 0;
+        }
+        li + li { margin-top: 6px; }
+        label {
+          display: flex;
+          gap: 8px;
+          align-items: flex-start;
+          padding: 8px;
+          border: 1px solid #d7e3df;
+          border-radius: 8px;
+          cursor: pointer;
+        }
+        input { margin-top: 2px; flex: 0 0 auto; }
+        .body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+        .time { color: #5d6f6b; font-size: 11px; }
+        .text {
+          overflow-wrap: anywhere;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+        .badge { color: #0f766e; font-size: 11px; font-weight: 600; }
+        .footer { display: flex; gap: 8px; margin-top: 10px; }
+        .start, .watch { flex: 1; padding: 8px 10px; border-radius: 8px; font-weight: 600; }
+        .start { background: #0f766e; color: #ffffff; }
+        .start:disabled { background: #9aa8a4; cursor: default; }
+      `;
+
+      const card = document.createElement("section");
+      card.className = "card";
+      card.setAttribute("role", "dialog");
+      card.setAttribute("aria-label", "Choose messages");
+
+      const top = document.createElement("div");
+      top.className = "top";
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = "Choose messages";
+      const count = document.createElement("div");
+      count.className = "count";
+      top.append(title, count);
+
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = "Scroll the chat, then refresh, to add older messages.";
+
+      const tools = document.createElement("div");
+      tools.className = "tools";
+      const selectAll = document.createElement("button");
+      selectAll.type = "button";
+      selectAll.textContent = "Select all";
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.textContent = "Clear";
+      const refresh = document.createElement("button");
+      refresh.type = "button";
+      refresh.textContent = "Refresh";
+      tools.append(selectAll, clear, refresh);
+
+      const list = document.createElement("ul");
+      list.className = "list";
+
+      const footer = document.createElement("div");
+      footer.className = "footer";
+      const start = document.createElement("button");
+      start.type = "button";
+      start.className = "start";
+      start.textContent = "Start selected";
+      const watch = document.createElement("button");
+      watch.type = "button";
+      watch.className = "watch";
+      watch.textContent = "Watch only";
+      footer.append(start, watch);
+
+      card.append(top, hint, tools, list, footer);
+      shadow.append(style, card);
+
+      chooserSession = { host, resolve, items };
+
+      function syncStartButton() {
+        start.disabled = !chooserSession?.items.some((item) => item.checked);
+      }
+
+      function renderRows() {
+        const session = chooserSession;
+        if (!session) return;
+        count.textContent = session.items.length === 1 ? "1 message" : `${session.items.length} messages`;
+        list.replaceChildren();
+        for (const item of session.items) {
+          const row = document.createElement("li");
+          const label = document.createElement("label");
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.checked = item.checked;
+          box.addEventListener("change", () => {
+            item.checked = box.checked;
+            syncStartButton();
+          });
+          const body = document.createElement("span");
+          body.className = "body";
+          if (item.time) {
+            const time = document.createElement("span");
+            time.className = "time";
+            time.textContent = item.time;
+            body.append(time);
+          }
+          const text = document.createElement("span");
+          text.className = "text";
+          text.textContent = item.text;
+          body.append(text);
+          if (item.seen) {
+            const badge = document.createElement("span");
+            badge.className = "badge";
+            badge.textContent = "Already seen";
+            body.append(badge);
+          }
+          label.append(box, body);
+          row.append(label);
+          list.append(row);
+        }
+        syncStartButton();
+      }
+
+      function finish(watchOnly) {
+        const session = chooserSession;
+        if (!session) return;
+        const chosen = session.items.map((item) => ({
+          id: item.id,
+          text: item.text,
+          time: item.time,
+          seen: item.seen,
+          checked: item.checked
+        }));
+        closeChooser({
+          cancelled: false,
+          watchOnly,
+          messages: chosen,
+          selected: chosen.filter((item) => item.checked)
+        });
+      }
+
+      selectAll.addEventListener("click", () => {
+        if (!chooserSession) return;
+        for (const item of chooserSession.items) item.checked = true;
+        renderRows();
+      });
+      clear.addEventListener("click", () => {
+        if (!chooserSession) return;
+        for (const item of chooserSession.items) item.checked = false;
+        renderRows();
+      });
+      refresh.addEventListener("click", () => {
+        if (!chooserSession) return;
+        chooserSession.items = mergeChooserItems(chooserSession.items, screenMessages());
+        renderRows();
+      });
+      start.addEventListener("click", () => {
+        if (!chooserSession?.items.some((item) => item.checked)) return;
+        finish(false);
+      });
+      watch.addEventListener("click", () => finish(true));
+
+      document.documentElement.appendChild(host);
+      renderRows();
+    });
+  }
+
+  function stopKick(generation) {
+    if (generation !== kickGeneration) return { ok: true, cancelled: true };
+    if (!state.enabled) {
+      report({ type: "STATUS", status: "Paused" });
+      return { ok: false, error: "Paused" };
+    }
+    return null;
+  }
+
+  async function resumeWatching() {
+    state.seeded = true;
+    state.releaseLatest = false;
+    const current = await chrome.storage.local.get({ jobStatus: "" });
+    if ((current.jobStatus || "") === "Choose messages") {
+      report({ type: "STATUS", status: `Watching ${state.groupName}` });
+    }
+  }
+
+  async function applyChooserChoice(choice, generation) {
+    const listed = Array.isArray(choice?.messages) ? choice.messages : [];
+    await persistSeenIds(listed.map((message) => message.id));
+    const stopped = stopKick(generation);
+    if (stopped) return stopped;
+    state.seeded = true;
+    state.releaseLatest = false;
+    if (choice.watchOnly || !choice.selected?.length) {
+      await resumeWatching();
+      return {
+        ok: true,
+        messages: listed.map((message) => ({ text: message.text, seen: true }))
+      };
+    }
+    let startedJob = false;
+    for (let index = 0; index < choice.selected.length; index += 1) {
+      const message = choice.selected[index];
+      const paused = stopKick(generation);
+      if (paused) {
+        if (startedJob) report({ type: "NEW_MESSAGE", groupName: state.groupName });
+        return paused;
+      }
+      await forgetSeen(message.id);
+      const decision = await emitMessage(
+        { id: message.id, text: message.text },
+        { replay: true, deferDrain: true, batchFollowup: index > 0 }
+      );
+      if (decision?.start) startedJob = true;
+    }
+    if (startedJob) report({ type: "NEW_MESSAGE", groupName: state.groupName });
+    const finished = stopKick(generation);
+    if (finished) return finished;
+    if (!startedJob) await resumeWatching();
+    return {
+      ok: true,
+      messages: listed.map((message) => ({
+        text: message.text,
+        seen: !choice.selected.some((item) => item.id === message.id)
+      }))
+    };
+  }
+
+  async function kickstart(generation) {
     state.enabled = true;
     state.testingMode = false;
     sessionReady = true;
@@ -1156,10 +1560,12 @@
       }
       state.testingMode = false;
       sessionReady = true;
-      if (!state.enabled) return { ok: false, error: "Paused" };
+      const paused = stopKick(generation);
+      if (paused) return paused;
       report({ type: "STATUS", status: "Detecting messages" });
       let detected = await readIncoming(state.groupName);
-      if (!state.enabled) return { ok: false, error: "Paused" };
+      const afterRead = stopKick(generation);
+      if (afterRead) return afterRead;
       if (!detected.messages.length) {
         await waitFor(() => (chatMessages().length ? true : null), 8000);
         detected = {
@@ -1176,23 +1582,16 @@
         report({ type: "STATUS", status: "No incoming message yet" });
         return { ok: true, messages: [] };
       }
-      const latest = messages[messages.length - 1];
+      const beforeChooser = stopKick(generation);
+      if (beforeChooser) return beforeChooser;
       state.releaseLatest = false;
-      await absorbVisibleMessages();
-      await forgetSeen(latest.id);
-      if (!state.enabled) return { ok: false, error: "Paused" };
-      state.testingMode = false;
-      state.seeded = true;
-      await emitMessage(latest);
-      return {
-        ok: true,
-        messages: messages.map((message) => ({
-          text: message.text,
-          seen: message.id !== latest.id && state.seenIds.has(message.id)
-        }))
-      };
+      report({ type: "STATUS", status: "Choose messages" });
+      const choice = await openChooser(messages);
+      const afterChoice = stopKick(generation);
+      if (afterChoice || !choice || choice.cancelled) return afterChoice || { ok: true, cancelled: true };
+      return await applyChooserChoice(choice, generation);
     } finally {
-      state.starting = false;
+      if (generation === kickGeneration) closeChooser({ cancelled: true });
     }
   }
 
@@ -1287,8 +1686,14 @@
       if (enabled) pauseOnStart = false;
       state.enabled = enabled;
       if (!state.enabled) {
+        const starting = state.starting;
         state.releaseLatest = false;
         kickStarted = false;
+        kickGeneration += 1;
+        kickPromise = null;
+        state.starting = false;
+        closeChooser({ cancelled: true });
+        if (starting) report({ type: "STATUS", status: "Paused" });
       }
       if (state.enabled) requestKickstart();
     }
@@ -1303,7 +1708,7 @@
     const current = await chrome.storage.local.get({ jobStatus: "" });
     if (!pauseOnStart) return;
     const patch = { enabled: false };
-    if (!/^(Searching|Saving|Sending|Detecting|Replying)/.test(current.jobStatus || "")) {
+    if (!/^(Searching|Saving|Sending|Detecting|Replying|Choose)/.test(current.jobStatus || "")) {
       patch.jobStatus = "Paused";
     }
     if (!pauseOnStart) return;
