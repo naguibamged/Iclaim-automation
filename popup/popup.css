@@ -33,11 +33,9 @@ header {
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  background: var(--accent);
-  color: var(--accent-ink);
-  display: grid;
-  place-items: center;
-  font-weight: 700;
+  object-fit: cover;
+  display: block;
+  flex: none;
 }
 
 h1 {

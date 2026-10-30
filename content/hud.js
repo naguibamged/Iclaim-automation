@@ -14,6 +14,7 @@
   host.style.setProperty("background", "transparent", "important");
 
   const shadow = host.attachShadow({ mode: "open" });
+  const iconUrl = chrome.runtime.getURL("icons/icon128.png");
   const style = document.createElement("style");
   style.textContent = `
     :host { color-scheme: light; }
@@ -47,12 +48,7 @@
       width: 22px;
       height: 22px;
       border-radius: 7px;
-      background: #0f766e;
-      color: #ffffff;
-      display: grid;
-      place-items: center;
-      font-size: 10px;
-      font-weight: 700;
+      background: url("${iconUrl}") center / cover no-repeat;
     }
     .hide {
       width: 22px;
@@ -135,13 +131,11 @@
       width: 36px;
       height: 36px;
       border-radius: 12px;
-      background: #0f766e;
-      color: #ffffff;
-      font: 700 12px/36px "Segoe UI", sans-serif;
+      background: url("${iconUrl}") center / cover no-repeat;
       box-shadow: 0 8px 24px rgba(16, 33, 30, 0.16);
     }
     .mark.is-live { animation: iclaim-pulse 1.4s ease-out infinite; }
-    .mark.is-error { background: #b42318; }
+    .mark.is-error { box-shadow: 0 0 0 2px #b42318; }
     @keyframes iclaim-spin { to { transform: rotate(360deg); } }
     @keyframes iclaim-pulse {
       0%, 100% { box-shadow: 0 0 0 0 rgba(15, 118, 110, 0.55); }
@@ -156,7 +150,7 @@
   top.className = "top";
   const brand = document.createElement("div");
   brand.className = "brand";
-  brand.textContent = "iC";
+  brand.setAttribute("aria-hidden", "true");
   const hide = document.createElement("button");
   hide.className = "hide";
   hide.type = "button";
@@ -216,7 +210,6 @@
   mark.className = "mark is-hidden";
   mark.type = "button";
   mark.setAttribute("aria-label", "Show Iclaim status");
-  mark.textContent = "iC";
 
   shadow.append(style, card, mark);
 
